@@ -4,7 +4,7 @@ A practical guide to deploying a VMware vSphere Kubernetes Service 3.7 workload 
 useful addon stack. It is organised around the decisions you have to make, in roughly the order you
 have to make them, and it uses one complete manifest as a worked example throughout.
 
-The example manifest is [`reference-profile.yaml`](./reference-profile.yaml). It deploys five addons
+The example manifest referenced is [`reference-profile.yaml`](./reference-profile.yaml). It deploys five sample and suggested addons
 (helm-controller, cert-manager, Prometheus, Istio, Headlamp) onto a cluster built from the
 `builtin-generic-v3.7.0` ClusterClass, with OIDC authentication and dedicated node volumes. Open it
 alongside this guide.
@@ -104,10 +104,6 @@ writes the kubeconfig:
 
 ```bash
 vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN> --type k8s
-
-# if the Supervisor sits behind a private or enterprise CA
-vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN> \
-  --ca-certificate /path/to/ca-cert --type k8s
 ```
 
 You end up with one context per vSphere Namespace you can reach, and one per workload cluster. Two
@@ -125,14 +121,10 @@ kubectl config use-context vks:<CLUSTER_NAME>                # in-cluster checks
 
 Commands in this guide run against the Supervisor unless stated otherwise.
 
-One useful consequence: `vcf context create` regenerates a working kubeconfig whenever you need one,
+One useful consequence: `vcf context refresh` regenerates a working kubeconfig whenever you need one,
 so an outage at your identity provider does not lock you out of a cluster that uses OIDC.
 
 ### 1.2 Platform prerequisites
-
-VKS accepts objects that reference resources it cannot find, and only stalls later. A `Cluster` whose
-VM class is not available to the namespace is admitted happily and then never provisions a machine.
-Checking first is cheap.
 
 | Requirement | Check |
 | --- | --- |
@@ -184,7 +176,7 @@ before you pick a prefix.
 
 ### 1.4 What to change before production
 
-The reference profile makes several choices that suit a lab. None of them is a mistake in that
+The reference profile makes several choices that suit a lab/dev/test. None of them is a mistake in that
 context; all of them should change before real workloads arrive.
 
 | Setting in the profile | Production choice |
@@ -253,7 +245,7 @@ The newest compatible release is not automatically the right one.
 | --- | --- |
 | Patch level | Among releases of the same minor, prefer the highest patch you have validated. These carry CVE and bug fixes. |
 | Validation | Prefer a release you have run somewhere else first, and stay inside the support window. |
-| ClusterClass pairing | The Kubernetes version and the ClusterClass move together. Do not bump one on its own. |
+| ClusterClass pairing | The Kubernetes version and the ClusterClass move together. You cannot bump one on its own. |
 | Upgrade path | One minor version at a time. Skipping minors is unsupported. |
 | Fleet consistency | Standardise on one release per environment tier. Five patch levels across a fleet adds troubleshooting effort with no benefit. |
 

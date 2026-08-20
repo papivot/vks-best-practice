@@ -68,7 +68,7 @@ A hardened, copy-pasteable version of the whole manifest is in
 Numbered sections build on each other and are best read in order. The appendices are reference
 material you can jump to directly. Each section opens with what it covers and why it matters.
 
-- [ Read this first: this is a reference profile, not a production baseline](#-read-this-first-this-is-a-reference-profile-not-a-production-baseline)
+- [Read this first: this is a reference profile, not a production baseline](#read-this-first-this-is-a-reference-profile-not-a-production-baseline)
 - [The reference profile](#the-reference-profile)
     - [What is in it](#what-is-in-it)
     - [The shape of it](#the-shape-of-it)
@@ -189,13 +189,13 @@ This document is not a survey of options — it annotates **one complete, workin
 field. Knowing what that manifest contains before you start makes the rest of the document read as a
 walkthrough rather than a list of disconnected settings.
 
-📄 **The full manifest lives alongside this document as [`reference-profile.yaml`](./reference-profile.yaml).**
+**The full manifest lives alongside this document as [`reference-profile.yaml`](./reference-profile.yaml).**
 It carries the same values discussed here, with a comment block above each object explaining what it
 is and why it is in the stack. Open it in a second window and read the two together.
 
->  **It is a learning and demonstration profile, not a deployable baseline.** Several values are
+> **It is a learning and demonstration profile, not a deployable baseline.** Several values are
 > deliberately permissive so the platform can be explored without HA or admission control in the way
-> — see [Read this first](#-read-this-first-this-is-a-reference-profile-not-a-production-baseline) for
+> — see [Read this first](#read-this-first-this-is-a-reference-profile-not-a-production-baseline) for
 > the full list, and [Appendix A](#appendix-a--production-baseline-manifest) for the hardened
 > counterpart.
 
@@ -426,7 +426,7 @@ Then copy the **`NAME`**, not the `VERSION`, into `topology.version`:
 | `kr` `NAME` | `v1.36.1---vmware.4-vkr.5` — **triple** dash | **This is what `topology.version` takes.** |
 | `kr` `VERSION` | `v1.36.1+vmware.4-vkr.5` — plus sign | The semver form. Appears in `Cluster.status` and `kubectl version`. |
 
-> ** The `---` is not a typo and not interchangeable with the `+` form.** The triple dash is a
+> **The `---` is not a typo and not interchangeable with the `+` form.** The triple dash is a
 > DNS-safe encoding of the `+` build separator, because the `+` is not legal in a Kubernetes
 > object name. Using the `+` form, or a single or double dash, produces a topology that never
 > reconciles.
@@ -437,7 +437,6 @@ Then copy the **`NAME`**, not the `VERSION`, into `topology.version`:
 | --- | --- |
 | **Newest vs. proven** | The newest compatible release is not automatically the right one. Prefer a release you have validated, and stay within the support window. |
 | **Patch level** | Among releases of the same minor, prefer the highest patch you have validated — these carry CVE and bug fixes. |
-| **FIPS variants** | Releases with `-fips` in the name are FIPS-validated builds. Choose these only if you have a compliance requirement — they may lag on version. Do not mix FIPS and non-FIPS across a fleet by accident. |
 | **ClusterClass compatibility** | The Kubernetes version and the ClusterClass move together. Do not bump one independently. |
 | **Upgrade path** | **One minor version at a time.** Skipping minors is unsupported. Plan `1.35 → 1.36 → 1.37`, not `1.35 → 1.37`. |
 | **Fleet consistency** | Standardise on one release per environment tier. A fleet on five different patch levels is a support and troubleshooting burden with no upside. |
@@ -952,13 +951,13 @@ spec:
           namespace: istio-ingress     # ← separate from istio-system: good practice
           autoscaling:
             enabled: true
-            minReplicas: 1             # ←  single ingress pod = outage on reschedule
+            minReplicas: 1             # ← single ingress pod = outage on reschedule
             maxReplicas: 5
       pilot:
-        replicas: 1                    # ←  conflicts with the HPA below
+        replicas: 1                    # ← conflicts with the HPA below
         autoscaling:
           enabled: true
-          minReplicas: 1               # ←  istiod is the Gateway controller: SPOF
+          minReplicas: 1               # ← istiod is the Gateway controller: SPOF
           maxReplicas: 2
       meshConfig:
         accessLogFile: ""              # ← gateway access logging DISABLED
@@ -1043,7 +1042,7 @@ spec:
       # This client ID must also appear in the API server's extraAuthentication
       # audiences list, or tokens issued here are rejected by the cluster.
       clientID: <OIDC_CLIENT_ID>
-      clientSecret: <OIDC_CLIENT_SECRET>   # ←  plaintext in etcd and in Git
+      clientSecret: <OIDC_CLIENT_SECRET>   # ← plaintext in etcd and in Git
       callbackURL: https://headlamp.k8s.example.com/oidc-callback
       scopes:
       - openid                             # ← mandatory for OIDC
@@ -1051,7 +1050,7 @@ spec:
       - profile                            # ← convenience only
 ```
 
-> ** The one hard prerequisite: a gateway controller.**
+> **The one hard prerequisite: a gateway controller.**
 >
 > `gatewayApi.gateway.className` must name a controller that exists in the cluster. That means
 > **you must install either the `istio` addon (with `gateways.ingress.enabled: true`) or the
@@ -1123,7 +1122,7 @@ an IP after the fact.
 | `oidc.callbackURL` | The post-authentication redirect target. | Must be registered with the IdP, and its host must equal `hostname`. Failures appear on the provider's error page, not in Kubernetes. |
 | `oidc.scopes` | `openid` is required by the spec. `email` requests the email claim. `profile` requests name and picture. | **`email` is load-bearing.** The API server maps the `email` claim to the Kubernetes username. Drop the scope and the claim is absent, so username mapping fails — login appears to work while authorization fails everywhere. If you change the API server's `username.claim`, request the matching scope here. |
 
-> ** Authentication is not authorization — you must also create RBAC.**
+> **Authentication is not authorization — you must also create RBAC.**
 >
 > Configuring OIDC proves *who* a user is. It grants them **nothing**. A user who logs into
 > Headlamp successfully with no RBAC binding sees permission errors everywhere and will report the
@@ -1669,7 +1668,7 @@ The densest and most consequential variable in the manifest.
 | Consideration | Detail |
 | --- | --- |
 | Why size it explicitly | etcd stores every object plus revision history until compaction. **An addon stack of this size is exactly the workload that grows etcd** — five addons bring many CRDs, and operators are chatty: the Prometheus operator, cert-manager, and kapp-controller all write status and events continuously. |
-| **⚠️ The read-only alarm** | Exceeding the quota raises a `NOSPACE` alarm and puts etcd **read-only**. Every write fails. It presents as a total cluster outage and **does not clear on its own** — you must compact, defragment, and explicitly disarm the alarm, all requiring etcd-level access at the moment your control plane appears dead. |
+| **The read-only alarm** | Exceeding the quota raises a `NOSPACE` alarm and puts etcd **read-only**. Every write fails. It presents as a total cluster outage and **does not clear on its own** — you must compact, defragment, and explicitly disarm the alarm, all requiring etcd-level access at the moment your control plane appears dead. |
 | Prerequisite | The **etcd volume must actually have the space.** Setting a quota larger than the disk converts a clean quota stop into a disk-full condition, which is worse. |
 | **Recommendation** | **Monitor etcd database size and alert at 60–70% of the quota.** You have Prometheus in this stack; use it. That converts an outage into a ticket. Also confirm auto-compaction is running. |
 | `maxRequestSizeKiB` | Also available in 3.7. Raise only if you have genuinely large objects — large CRDs or ConfigMaps. Raising it lets clients push more per request, which grows etcd faster. |
@@ -1900,7 +1899,7 @@ significant security improvement.
 | `audiences` | A token is accepted only if its `aud` claim is in this list. This is what stops a token minted for another application being replayed against your cluster. | **Must contain the client ID your UI or CLI uses.** If it does not, users authenticate successfully at the IdP and then every API call fails — a symptom that points nowhere near the cause. |
 | `claimMappings.username.claim` | Which claim becomes the Kubernetes username. `email` is stable, human-readable, and matches how people think about identity. | Requires the corresponding scope to be requested by the client. Note `email` is not immutable at every IdP — if a user's address changes, their Kubernetes identity changes and their RBAC bindings stop applying. Where available, an immutable subject identifier (`sub`) is more robust at the cost of unreadable RBAC. |
 | `claimMappings.username.prefix` | **A mandatory security control.** The prefix namespaces external identities so they cannot collide with — and therefore cannot impersonate — built-in Kubernetes subjects such as `system:masters` members or ServiceAccounts (`system:serviceaccount:...`). Without it, an IdP that lets a user set an arbitrary email could mint an identity RBAC already trusts. | **Never leave it empty.** And note that **changing it orphans every existing RBAC binding at once** — the username string changes, bindings naming the old form stop matching, and every user loses access simultaneously. Choose it once. |
-| `claimMappings.groups.claim` | Maps an IdP group claim to Kubernetes groups, enabling group-based RBAC — the only approach that scales. | **⚠️ Verify your IdP actually emits this claim.** Many do not by default: some require a specific scope, some need the claim explicitly added to the token, and some require a directory-API integration or a broker (Dex, Keycloak) to enrich tokens. If the claim is absent, group bindings silently do nothing — and you discover it only after designing your RBAC around them. **Inspect a real token before relying on groups.** |
+| `claimMappings.groups.claim` | Maps an IdP group claim to Kubernetes groups, enabling group-based RBAC — the only approach that scales. | **Verify your IdP actually emits this claim.** Many do not by default: some require a specific scope, some need the claim explicitly added to the token, and some require a directory-API integration or a broker (Dex, Keycloak) to enrich tokens. If the claim is absent, group bindings silently do nothing — and you discover it only after designing your RBAC around them. **Inspect a real token before relying on groups.** |
 | `claimMappings.groups.prefix` | Same anti-impersonation reasoning, and more urgent here: without it, an IdP group literally named `system:masters` would grant cluster-admin outright. | Not optional. |
 | `claimValidationRules` | Additional trust conditions. Two forms: `claim` + `requiredValue` for a simple equality check, or `expression` for CEL. | The sample's rule **fails open** — see below. |
 | `message` | The error returned on rejection. | Make it describe what actually happened. A message claiming email verification is required, on a rule that does not require it, is worse than no message — it stops you looking. |
@@ -1919,7 +1918,7 @@ Verify availability against your ClusterClass schema:
 | `claimMappings.extra` | Maps arbitrary claims into extra user attributes, consumable by authorization webhooks. |
 | `userValidationRules` | CEL rules validating the **mapped user** rather than the raw claims — for example asserting the username carries the expected prefix. A useful defence-in-depth layer on top of `claimValidationRules`. |
 
-##### ⚠️ `claims.?email_verified.orValue(true)` admits unverified identities
+##### `claims.?email_verified.orValue(true)` admits unverified identities
 
 ```
 claims.?email_verified.orValue(true) == true
@@ -1950,7 +1949,7 @@ Kubernetes identity.
 security predicate — when you cannot prove the condition holds, deny. Apply the same reasoning to
 every CEL rule you write.
 
-> **⚠️ You must also create RBAC inside the workload cluster.**
+> **You must also create RBAC inside the workload cluster.**
 >
 > This configures authentication only. **A successfully authenticated user has zero permissions**
 > until an RBAC binding names them, and the resulting experience looks like a broken cluster rather
@@ -2022,7 +2021,7 @@ every CEL rule you write.
 | Consideration | Detail |
 | --- | --- |
 | Why it is separate | The CNI must be installed as the cluster bootstraps — nodes cannot become `Ready` and pods cannot get addresses without it. Hence "bootstrap" addons, configured here rather than as an `AddonInstall`. |
-| **⚠️ Effectively irreversible** | **CNI is a create-time decision.** There is no supported in-place migration: changing it means building a new cluster and migrating workloads. |
+| **Effectively irreversible** | **CNI is a create-time decision.** There is no supported in-place migration: changing it means building a new cluster and migrating workloads. |
 | Your options | List them with `kubectl get acd -n vmware-system-vks-public \| grep -E '^(antrea\|calico\|cilium)'`. A default catalogue offers **`antrea`**, **`calico`**, and **`cilium`**. |
 | **`antrea`** | The VMware-supported default. Integrates with the vSphere networking stack, supports Kubernetes NetworkPolicy plus richer Antrea policy CRDs, and handles the reserved `240.0.0.0/4` pod CIDR used here. **Choose this unless you have a specific reason not to.** |
 | **`calico`** | Mature, widely deployed, strong policy model. Reasonable if it is your organisational standard. |
@@ -3901,7 +3900,7 @@ vsphere-pv-csi.tanzu.vmware.com.3.8.0+vmware.3-tkg.1
 - The Gateway API version is here too, which is what makes `gatewayApi.enabled: true` work for
   Headlamp ([6.5](#65-headlamp)) with no CRD installation on your part.
 
-> **⚠️ A Kubernetes "patch" release is not only a patch.** Diffing the two v1.36 releases above,
+> **A Kubernetes "patch" release is not only a patch.** Diffing the two v1.36 releases above,
 > **all ten bootstrap packages changed:**
 >
 > | Component | `vkr.5` → `vkr.3` | Significance |

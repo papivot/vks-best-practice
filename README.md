@@ -36,7 +36,7 @@ improve readability, it is noted as optional.
 
 ---
 
-## ⚠️ Read this first: this is a reference profile, not a production baseline
+## Read this first: this is a reference profile, not a production baseline
 
 The manifest annotated here is a **working reference** — ideal for learning the object model and
 for a proof of concept. Several values are deliberately permissive for a lab and should change
@@ -68,7 +68,7 @@ A hardened, copy-pasteable version of the whole manifest is in
 Numbered sections build on each other and are best read in order. The appendices are reference
 material you can jump to directly. Each section opens with what it covers and why it matters.
 
-- [⚠️ Read this first: this is a reference profile, not a production baseline](#-read-this-first-this-is-a-reference-profile-not-a-production-baseline)
+- [ Read this first: this is a reference profile, not a production baseline](#-read-this-first-this-is-a-reference-profile-not-a-production-baseline)
 - [The reference profile](#the-reference-profile)
     - [What is in it](#what-is-in-it)
     - [The shape of it](#the-shape-of-it)
@@ -193,7 +193,7 @@ walkthrough rather than a list of disconnected settings.
 It carries the same values discussed here, with a comment block above each object explaining what it
 is and why it is in the stack. Open it in a second window and read the two together.
 
-> ⚠️ **It is a learning and demonstration profile, not a deployable baseline.** Several values are
+>  **It is a learning and demonstration profile, not a deployable baseline.** Several values are
 > deliberately permissive so the platform can be explored without HA or admission control in the way
 > — see [Read this first](#-read-this-first-this-is-a-reference-profile-not-a-production-baseline) for
 > the full list, and [Appendix A](#appendix-a--production-baseline-manifest) for the hardened
@@ -426,7 +426,7 @@ Then copy the **`NAME`**, not the `VERSION`, into `topology.version`:
 | `kr` `NAME` | `v1.36.1---vmware.4-vkr.5` — **triple** dash | **This is what `topology.version` takes.** |
 | `kr` `VERSION` | `v1.36.1+vmware.4-vkr.5` — plus sign | The semver form. Appears in `Cluster.status` and `kubectl version`. |
 
-> **⚠️ The `---` is not a typo and not interchangeable with the `+` form.** The triple dash is a
+> ** The `---` is not a typo and not interchangeable with the `+` form.** The triple dash is a
 > DNS-safe encoding of the `+` build separator, because the `+` is not legal in a Kubernetes
 > object name. Using the `+` form, or a single or double dash, produces a topology that never
 > reconciles.
@@ -952,13 +952,13 @@ spec:
           namespace: istio-ingress     # ← separate from istio-system: good practice
           autoscaling:
             enabled: true
-            minReplicas: 1             # ← ⚠️ single ingress pod = outage on reschedule
+            minReplicas: 1             # ←  single ingress pod = outage on reschedule
             maxReplicas: 5
       pilot:
-        replicas: 1                    # ← ⚠️ conflicts with the HPA below
+        replicas: 1                    # ←  conflicts with the HPA below
         autoscaling:
           enabled: true
-          minReplicas: 1               # ← ⚠️ istiod is the Gateway controller: SPOF
+          minReplicas: 1               # ←  istiod is the Gateway controller: SPOF
           maxReplicas: 2
       meshConfig:
         accessLogFile: ""              # ← gateway access logging DISABLED
@@ -1043,15 +1043,15 @@ spec:
       # This client ID must also appear in the API server's extraAuthentication
       # audiences list, or tokens issued here are rejected by the cluster.
       clientID: <OIDC_CLIENT_ID>
-      clientSecret: <OIDC_CLIENT_SECRET>   # ← ⚠️ plaintext in etcd and in Git
+      clientSecret: <OIDC_CLIENT_SECRET>   # ←  plaintext in etcd and in Git
       callbackURL: https://headlamp.k8s.example.com/oidc-callback
       scopes:
       - openid                             # ← mandatory for OIDC
-      - email                              # ← ⚠️ load-bearing: feeds the username claim
+      - email                              # ← load-bearing: feeds the username claim
       - profile                            # ← convenience only
 ```
 
-> **⚠️ The one hard prerequisite: a gateway controller.**
+> ** The one hard prerequisite: a gateway controller.**
 >
 > `gatewayApi.gateway.className` must name a controller that exists in the cluster. That means
 > **you must install either the `istio` addon (with `gateways.ingress.enabled: true`) or the
@@ -1123,7 +1123,7 @@ an IP after the fact.
 | `oidc.callbackURL` | The post-authentication redirect target. | Must be registered with the IdP, and its host must equal `hostname`. Failures appear on the provider's error page, not in Kubernetes. |
 | `oidc.scopes` | `openid` is required by the spec. `email` requests the email claim. `profile` requests name and picture. | **`email` is load-bearing.** The API server maps the `email` claim to the Kubernetes username. Drop the scope and the claim is absent, so username mapping fails — login appears to work while authorization fails everywhere. If you change the API server's `username.claim`, request the matching scope here. |
 
-> **⚠️ Authentication is not authorization — you must also create RBAC.**
+> ** Authentication is not authorization — you must also create RBAC.**
 >
 > Configuring OIDC proves *who* a user is. It grants them **nothing**. A user who logs into
 > Headlamp successfully with no RBAC binding sees permission errors everywhere and will report the
@@ -1285,7 +1285,7 @@ NODE                                POD_CIDR       MAXPODS
 <cluster>-node-pool-1-...-m9b9p     240.0.1.0/24   110      ← worker:        block 2
 ```
 
-#### ⚠️ Reserve at least one spare block for upgrades
+#### Reserve at least one spare block for upgrades
 
 Every rolling operation in Cluster API is **surge-then-remove**: a replacement node is created and
 brought to `Ready` *before* the node it replaces is deleted. A `MachineDeployment` rolling update
@@ -1492,7 +1492,7 @@ kubectl explain cluster.spec.topology.variables
       metadata:
         annotations:
           run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-      replicas: 1                          # ← ⚠️ dev/test only: no HA, no etcd quorum
+      replicas: 1                          # ← dev/test only: no HA, no etcd quorum
       variables:
         overrides:                         # ← per-pool override of a cluster-wide variable
         - name: vmClass
@@ -1617,7 +1617,7 @@ The densest and most consequential variable in the manifest.
           maximumDBSizeGiB: 4
         security:
           podSecurityStandard:
-            audit: privileged              # ← ⚠️ dev/test reference values
+            audit: privileged              # ← dev/test reference values
             auditVersion: latest
             deactivated: false
             enforce: privileged
@@ -1643,7 +1643,7 @@ The densest and most consequential variable in the manifest.
                   claim: groups
                   prefix: "oidc-groups:"
               claimValidationRules:
-              - expression: 'claims.?email_verified.orValue(true) == true'   # ← ⚠️ FAILS OPEN
+              - expression: 'claims.?email_verified.orValue(true) == true'   # ← FAILS OPEN
                 message: "email must be verified"
         kubeletConfiguration:
           logging:
@@ -3419,7 +3419,7 @@ The base manifest has three gaps: it authenticates without authorizing, it accep
 certificate for the UI, and it installs a monitoring operator without giving it anything to do.
 This appendix closes them.
 
-> **⚠️ Context.** Unlike Appendix A, these objects are applied **inside the workload cluster**, not
+> **Context.** Unlike Appendix A, these objects are applied **inside the workload cluster**, not
 > to the vSphere Namespace. Switch your `kubectl` context first.
 
 ### B.1 RBAC for OIDC identities

@@ -1,0 +1,495 @@
+# =============================================================================
+#  VKS 3.7 — REFERENCE PROFILE
+#
+#  The complete manifest annotated field-by-field in
+#  VKS-3.7-Addons-Best-Practices.md. Read the two side by side: every value
+#  here has a corresponding explanation in the section named below each block.
+#
+#  ---------------------------------------------------------------------------
+#  ⚠️  THIS IS A LEARNING AND DEMONSTRATION PROFILE, NOT A PRODUCTION BASELINE.
+#
+#  Several values below are deliberately permissive so the platform can be
+#  explored without admission control or HA getting in the way:
+#
+#    * controlPlane.replicas: 1        no etcd quorum; every rollout is downtime
+#    * vmClass: best-effort-*          no CPU/memory reservation
+#    * podSecurityStandard: privileged Pod Security enforces nothing
+#    * *Version: latest                PSS semantics can tighten on upgrade
+#    * pilot/ingress minReplicas: 1    single points of failure
+#    * pods: 240.0.0.0/20              only 16 per-node blocks; IMMUTABLE
+#    * clientSecret inline             plaintext in etcd and in Git
+#
+#  And one value is a defect in ANY environment, not a dev/prod trade-off:
+#
+#    * claims.?email_verified.orValue(true)   ← FAILS OPEN. See Pitfall 1.
+#
+#  For a hardened, deployable manifest see APPENDIX A of the document.
+#  ---------------------------------------------------------------------------
+#
+#  BEFORE APPLYING, substitute:
+#    <VSPHERE_NAMESPACE>     your vSphere Namespace on the Supervisor
+#    <STORAGE_CLASS>         a StorageClass associated with that namespace
+#    <OIDC_CLIENT_ID>        your identity provider's client ID
+#    <OIDC_CLIENT_SECRET>    the matching secret (better: reference a Secret)
+#    headlamp.k8s.example.com / idp.example.com / ntp.example.com
+#
+#  VERIFY FIRST (see doc section 1):
+#    kubectl config current-context                        # Supervisor context
+#    kubectl get virtualmachineclass                       # VM classes bound?
+#    kubectl describe ns <VSPHERE_NAMESPACE> | grep storageclass
+#    kubectl get kr                                        # READY + COMPATIBLE
+#
+#  Apply order is irrelevant — all addons reconcile independently (section 4).
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+#  1 of 6 — helm-controller                                    [doc section 6.1]
+#
+#  WHAT IT IS:  Declarative Helm chart lifecycle management inside the workload
+#               cluster. You create HelmRelease objects; it reconciles them,
+#               handling upgrades, rollbacks, and drift.
+#  WHY IT'S HERE: A day-2 capability for YOUR OWN charts. It is NOT a
+#               prerequisite for the other addons — those are Carvel packages
+#               reconciled by kapp-controller and do not wait for it. Include it
+#               because you want GitOps-style Helm management, not because the
+#               stack requires it.
+#  WHY IT MATTERS TO THE DOC: It is the clearest illustration that AddonConfig
+#               is a SPARSE OVERLAY — this config sets only two fields and
+#               everything else comes from schema defaults.
+# -----------------------------------------------------------------------------
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonInstall
+metadata:
+  name: cluster-helm-controller
+  namespace: <VSPHERE_NAMESPACE>          # vSphere Namespace, NOT a guest namespace
+spec:
+  addonRef:
+    name: helm-controller                 # must match `vcf addon available list`
+  clusters:
+  - selector:                             # a LIST — multiple selectors allowed
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: workload-vsphere-vks2
+---
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonConfig
+metadata:
+  annotations:
+    # Ties this config's lifecycle to the addon and cluster so it is garbage
+    # collected on teardown. Set this on EVERY AddonConfig.
+    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
+  # NAME IS A BINDING CONTRACT: <clusterName>-<addonRef.name>. If it does not
+  # resolve, spec.clusterName stays empty and the config is SILENTLY SKIPPED.
+  name: workload-vsphere-vks2-helm-controller
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  values:
+    # Empty string = no PriorityClass. These controllers reconcile your
+    # HelmReleases; at zero priority they are as evictable as a batch job.
+    helmController:
+      priorityClassName: ""
+    sourceController:
+      priorityClassName: ""
+
+
+---
+# -----------------------------------------------------------------------------
+#  2 of 6 — cert-manager                                       [doc section 6.2]
+#
+#  WHAT IT IS:  Certificate issuance and rotation, driven by Issuer and
+#               ClusterIssuer resources.
+#  WHY IT'S HERE: A real dependency, not decoration. The Headlamp addon creates
+#               its own cert-manager Issuer and Certificate and terminates TLS
+#               on its Gateway with the result — so the UI depends on it.
+#  WHY IT MATTERS TO THE DOC: Note the absence of an AddonConfig. Omitting one
+#               is legal and means "take all schema defaults", which is the
+#               right choice here. Do not infer that a config is mandatory.
+#  PRODUCTION NOTE: The issuer Headlamp creates is SELF-SIGNED, so browsers
+#               warn. Add a trusted-CA ClusterIssuer — see Appendix B.2.
+# -----------------------------------------------------------------------------
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonInstall
+metadata:
+  name: cluster-cert-manager
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  addonRef:
+    name: cert-manager
+  clusters:
+  - selector:
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: workload-vsphere-vks2
+
+
+---
+# -----------------------------------------------------------------------------
+#  3 of 6 — Prometheus                                         [doc section 6.3]
+#
+#  WHAT IT IS:  Metrics collection. Here: exporters plus the prometheus-operator
+#               and its CRDs, but deliberately NO packaged Prometheus server.
+#  WHY IT'S HERE: The operator-managed pattern. Rather than accepting the
+#               packaged server and its baked-in settings, you enable the
+#               operator and declare your own Prometheus custom resource —
+#               giving you control over replicas, retention, persistent storage,
+#               and scrape config as version-controlled objects.
+#  WHY IT MATTERS TO THE DOC: It has one requirement that is easy to miss:
+#               YOU MUST ACTUALLY CREATE THE Prometheus CR. Until you do, the
+#               exporters produce metrics and nothing scrapes or evaluates them,
+#               so no alerts ever fire. See Appendix B.3 for the CR.
+#               Check with: kubectl get prometheus,servicemonitor -A
+#  NOTE THE NAMING: the AddonInstall is `cluster-prom` but the ADDON is
+#               `prometheus`, so the AddonConfig must be
+#               `workload-vsphere-vks2-prometheus`. Naming it `-prom` matches
+#               nothing. This is the canonical instance of Pitfall 2.
+# -----------------------------------------------------------------------------
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonInstall
+metadata:
+  name: cluster-prom                      # install name is arbitrary...
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  addonRef:
+    name: prometheus                      # ...this is the name that matters
+  clusters:
+  - selector:
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: workload-vsphere-vks2
+---
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonConfig
+metadata:
+  annotations:
+    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
+  name: workload-vsphere-vks2-prometheus   # "prometheus", not "prom"
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  values:
+    # Keys are matched literally: lowercase `deploycomponents`, hyphenated
+    # component names. A "corrected" camelCase key is not applied.
+    deploycomponents:
+      kube-state-metrics: true             # Kubernetes object-state metrics
+      node-exporter: true                  # per-node OS/hardware metrics
+      pushgateway: false                   # correctly disabled
+      prometheus: false                    # intentional: operator-managed
+      alertmanager: true                   # needs a rule evaluator + receivers
+      prometheus-operator: true            # the CRDs you will drive
+
+
+---
+# -----------------------------------------------------------------------------
+#  4 of 6 — Istio                                              [doc section 6.4]
+#
+#  WHAT IT IS:  Here, an L4/L7 ingress gateway and the Gateway API controller —
+#               NOT a service mesh. No sidecars are injected, no workload mTLS,
+#               no east-west policy.
+#  WHY IT'S HERE: It provides the north-south entry point for the cluster, and
+#               the `istio` GatewayClass that the Headlamp UI binds to. (The
+#               `contour` addon is a lighter alternative if you only ever want
+#               HTTP ingress.)
+#  WHY IT MATTERS TO THE DOC: Scope changes which settings matter. In
+#               particular, the widely cited "Istio CNI forces privileged Pod
+#               Security" coupling DOES NOT APPLY here — it only holds once
+#               sidecar injection is enabled. Verify scope with:
+#                 kubectl get ns -L istio-injection,istio.io/dataplane-mode
+#               (all blank = gateway-only). So the `privileged` setting further
+#               down is a dev/test choice, not an Istio consequence.
+# -----------------------------------------------------------------------------
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonInstall
+metadata:
+  name: cluster-istio
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  addonRef:
+    name: istio
+  clusters:
+  - selector:
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: workload-vsphere-vks2
+---
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonConfig
+metadata:
+  annotations:
+    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
+  name: workload-vsphere-vks2-istio
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  values:
+    istio:
+      namespace: "istio-system"            # GUEST namespace; addon owns it
+      ambientMode:
+        enabled: false                     # no ambient dataplane
+      istioCNI:
+        enabled: false                     # not needed without sidecar injection
+      gateways:
+        ingress:
+          enabled: true                    # THE point of this addon
+          namespace: istio-ingress         # separate from the control plane
+          autoscaling:
+            enabled: true
+            minReplicas: 1                 # ⚠️ 1 = ingress outage on reschedule
+            maxReplicas: 5
+      pilot:
+        replicas: 1                        # ⚠️ conflicts with the HPA below
+        autoscaling:
+          enabled: true
+          minReplicas: 1                   # ⚠️ istiod programs all gateways
+          maxReplicas: 2
+      meshConfig:
+        accessLogFile: ""                  # ⚠️ your ingress request log, disabled
+        enableTracing: false
+        meshID: "workload-vsphere-vks2"    # names the cluster, not the mesh
+
+
+---
+# -----------------------------------------------------------------------------
+#  5 of 6 — Headlamp                                           [doc section 6.5]
+#
+#  WHAT IT IS:  A web UI for the cluster, exposed through a Gateway API Gateway
+#               and authenticated with OIDC.
+#  WHY IT'S HERE: It gives the stack a human-facing entry point, and it is the
+#               reason the API server carries an OIDC configuration further
+#               down — the UI obtains ID tokens that the API server must accept.
+#  WHY IT MATTERS TO THE DOC: It is the most cross-coupled object in the
+#               manifest, and the source of most "it deployed but does not
+#               work" reports:
+#                 * REQUIRES a gateway controller — the istio addon above, or
+#                   contour. The Gateway API CRDs come with the platform; a
+#                   controller does not.
+#                 * hostname == callbackURL host == a published DNS A record ==
+#                   a redirect URI registered with your IdP. All four or none.
+#                 * clientID must appear in the API server's `audiences` list,
+#                   or users log in fine and then fail every API call.
+#                 * The DNS record points at THIS Gateway's own LoadBalancer,
+#                   not the istio-ingress gateway's.
+#                 * Authentication is not authorization — you must also create
+#                   RBAC inside the cluster (Appendix B.1) or a successful login
+#                   grants nothing and the UI looks broken.
+# -----------------------------------------------------------------------------
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonInstall
+metadata:
+  name: cluster-headlamp
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  addonRef:
+    name: headlamp
+  clusters:
+  - selector:
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: workload-vsphere-vks2
+---
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonConfig
+metadata:
+  annotations:
+    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
+  name: workload-vsphere-vks2-headlamp
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  values:
+    # A real FQDN, published in DNS, pointing at this Gateway's LoadBalancer.
+    hostname: headlamp.k8s.example.com
+    gatewayApi:
+      enabled: true                        # Gateway API, not legacy Ingress
+      gateway:
+        className: istio                   # REQUIRES istio (or contour)
+        create: true                       # addon owns the Gateway + its LB
+        name: headlamp-gateway
+    oidc:
+      enabled: true
+      # Any OIDC-compliant provider. Must match the token's `iss` exactly.
+      issuerURL: https://idp.example.com
+      # Must also appear in the API server's extraAuthentication audiences.
+      clientID: <OIDC_CLIENT_ID>
+      clientSecret: <OIDC_CLIENT_SECRET>   # ⚠️ plaintext; prefer a Secret ref
+      # Must be a registered redirect URI at your IdP.
+      callbackURL: https://headlamp.k8s.example.com/oidc-callback
+      scopes:
+      - openid                             # mandatory
+      - email                              # load-bearing: feeds the username
+      - profile
+
+
+---
+# -----------------------------------------------------------------------------
+#  6 of 6 — The Cluster                                    [doc section 7, 7.1-7.13]
+#
+#  WHAT IT IS:  The workload cluster itself, defined by reference to the
+#               VMware-supplied `builtin-generic-v3.7.0` ClusterClass. The short
+#               spec below is expanded by that class into full infrastructure.
+#  WHY IT'S HERE: Everything above targets this cluster by label. This object
+#               also carries the OIDC configuration that makes Headlamp login
+#               work, the Pod Security posture, the node volumes, and the
+#               networking that determines how large the cluster can ever grow.
+#  WHY IT MATTERS TO THE DOC: This is where the irreversible decisions live.
+#               The ClusterClass defines which topology.variables exist, so this
+#               variable set is not portable across ClusterClass versions —
+#               inspect your own with:
+#                 kubectl get clusterclass builtin-generic-v3.7.0 \
+#                   -n vmware-system-vks-public \
+#                   -o jsonpath='{range .status.variables[*]}{.name}{"\n"}{end}'
+#               Doc section 8 isolates the fields you cannot change later.
+# -----------------------------------------------------------------------------
+apiVersion: cluster.x-k8s.io/v1beta2       # upstream Cluster API
+kind: Cluster
+metadata:
+  name: workload-vsphere-vks2              # matches every selector above
+  namespace: <VSPHERE_NAMESPACE>
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      # ⚠️ IMMUTABLE, and the most consequential number here. This is a pool of
+      # per-node /24 blocks, not a flat pool of IPs: a /20 yields 16 blocks for
+      # the WHOLE cluster, and one must always stay free for upgrade surge.
+      # Reserved 240/4 space avoids RFC1918 collisions. See doc 7.1.1.
+      - 240.0.0.0/20
+    serviceDomain: cluster.local
+    services:
+      cidrBlocks:
+      - 240.1.0.0/20                       # no overlap with the pod range
+  topology:
+    classRef:
+      name: builtin-generic-v3.7.0         # defines the variable schema below
+      namespace: vmware-system-vks-public  # VMware-managed; do not edit
+    controlPlane:
+      metadata:
+        annotations:
+          # A LABEL SELECTOR against OSImage objects. Test before applying:
+          #   kubectl get osimage -l os-name=ubuntu,os-version=24.04,\
+          #     run.tanzu.vmware.com/tkr=<kr-name>
+          # Expect exactly one match. See Appendix E.3.
+          run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
+      replicas: 1                          # ⚠️ no etcd quorum, no HA
+      variables:
+        overrides:                         # per-pool override of a cluster value
+        - name: vmClass
+          value: best-effort-large         # larger than workers: right instinct
+    variables:
+    - name: storageClass                   # for the nodes' own disks
+      value: <STORAGE_CLASS>
+    - name: vmClass
+      value: best-effort-medium            # ⚠️ no reservation; dev/test only
+    - name: volumes
+      # GOOD PRACTICE — keep this. Moves image layers and ephemeral pod storage
+      # off the node root disk, so one workload cannot wedge the node.
+      # Resizing later is a ROLLING NODE REPLACEMENT: size generously now.
+      value:
+      - capacity: 30Gi
+        mountPath: /var/lib/containerd     # container image layers
+        name: containerd
+        storageClass: <STORAGE_CLASS>
+      - capacity: 30Gi
+        mountPath: /var/lib/kubelet        # ephemeral pod storage, emptyDir, logs
+        name: kubelet
+        storageClass: <STORAGE_CLASS>
+    - name: kubernetes
+      value:
+        certificateRotation:
+          enabled: true                    # GOOD PRACTICE — keep this on
+          renewalDaysBeforeExpiry: 90
+        etcdConfiguration:
+          # Exceeding this puts etcd READ-ONLY until manually defragged and the
+          # alarm disarmed. Alert at 60-70%. The volume must have the space.
+          maximumDBSizeGiB: 4
+        security:
+          podSecurityStandard:
+            # ⚠️ `privileged` enforces NOTHING. Fine for a lab; for production
+            # use enforce: baseline with audit/warn: restricted, plus
+            # exemptions.namespaces for platform components. See doc 7.7.3.
+            audit: privileged
+            auditVersion: latest           # ⚠️ unpinned: upgrades can tighten
+            deactivated: false
+            enforce: privileged
+            enforceVersion: latest
+            warn: privileged
+            warnVersion: latest
+          resourceQuotaConfiguration:
+            enabled: true                  # a deliberate change from the default
+        apiServerConfiguration:
+          logs:
+            format: json                   # pairs with log forwarding
+          # Generic OIDC — any compliant provider. This is what makes the
+          # Headlamp login above usable, and it works for kubectl too.
+          extraAuthentication:
+            jwt:
+            - issuer:
+                url: https://idp.example.com      # must equal Headlamp's issuerURL
+                audiences:
+                - <OIDC_CLIENT_ID>                # must equal Headlamp's clientID
+                # For an internal IdP behind a private CA, also set:
+                #   certificateAuthority: | ...
+                #   egressSelectorType: cluster
+              claimMappings:
+                username:
+                  claim: email
+                  # NEVER empty: stops an external identity impersonating a
+                  # system: subject. Changing it orphans ALL RBAC bindings.
+                  prefix: "oidc:"
+                groups:
+                  # ⚠️ VERIFY your IdP actually emits this claim — many do not
+                  # by default, and group RBAC then silently does nothing.
+                  claim: groups
+                  prefix: "oidc-groups:"
+              claimValidationRules:
+              # ⚠️⚠️ THIS RULE FAILS OPEN. CEL optional chaining with
+              # orValue(TRUE) substitutes true when the claim is ABSENT, so a
+              # token omitting email_verified is ACCEPTED — the opposite of the
+              # message below. Use orValue(false). See Pitfall 1.
+              - expression: 'claims.?email_verified.orValue(true) == true'
+                message: "email must be verified"
+        kubeletConfiguration:
+          logging:
+            format: json
+          # NOT SET here: maxPods (default 110, documented max 250). Raising it
+          # buys pod density without consuming more pod CIDR blocks, but the
+          # automatic systemReserved calculation does NOT scale with pod count.
+          # See doc 7.1.1 and 7.13.
+    - name: bootstrapAddons
+      value:
+        cniRef:
+          # ⚠️ Effectively IMMUTABLE — changing the CNI means a new cluster.
+          # Alternatives in the catalogue: calico, cilium.
+          name: antrea
+          namespace: vmware-system-vks-public
+    - name: vsphereOptions
+      value:
+        persistentVolumes:
+          # For workload PVCs (distinct from the `storageClass` variable above,
+          # which is for node disks). Every class must be associated with the
+          # vSphere Namespace or PVCs pend indefinitely.
+          availableStorageClasses:
+          - <STORAGE_CLASS>
+          defaultStorageClass: <STORAGE_CLASS>
+    - name: osConfiguration
+      value:
+        ntp:
+          # A FUNCTIONAL PREREQUISITE, not hygiene: TLS validity windows, etcd
+          # leases, and OIDC exp/iat claims all depend on synchronised clocks.
+          # Skew produces intermittent auth failures that are hard to diagnose.
+          # Use multiple servers, same sources as vCenter and ESXi.
+          servers:
+          - ntp.example.com
+        sshd:
+          # Compliance/legal notice. Note the trailing space and the folded
+          # single-quoted style — preserve the quoting if you edit this.
+          banner: '---AUTHORIZED ACCESS ONLY--- Use of this system is restricted to
+            authorized users for authorized activities only. '
+    # Must be the NAME of a kr that is READY=True and COMPATIBLE=True. Note the
+    # TRIPLE dash — it encodes the `+` build separator, which is illegal in a
+    # Kubernetes object name. Check with `kubectl get kr`. See doc section 2.
+    version: v1.36.1---vmware.4-vkr.5
+    workers:
+      machineDeployments:
+      - class: node-pool                   # a class defined by the ClusterClass
+        metadata:
+          annotations:
+            # These are INPUT to the Cluster Autoscaler, which VKS installs for
+            # you — so they are effective. Do not also set `replicas`; a static
+            # value and an autoscaler would fight over the same field.
+            cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
+            cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
+            run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
+        name: node-pool-1

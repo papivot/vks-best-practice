@@ -1,787 +1,497 @@
-# VKS 3.7 Workload Cluster + Addons — Annotated Reference & Best Practices
+# VKS 3.7: Cluster and Addon Best Practices
 
-An annotated walkthrough of a VMware vSphere Kubernetes Service (VKS) 3.7 workload cluster and
-its recommended addon stack — **helm-controller, cert-manager, Prometheus, Istio, and
-Headlamp** — on the `builtin-generic-v3.7.0` ClusterClass, with OIDC authentication, Pod
-Security Standards, and dedicated node volumes.
+A practical guide to deploying a VMware vSphere Kubernetes Service 3.7 workload cluster with a
+useful addon stack. It is organised around the decisions you have to make, in roughly the order you
+have to make them, and it uses one complete manifest as a worked example throughout.
 
-Every field is explained: what it does, why you would set it, and where it will bite you.
-Sections follow the manifest order so you can read top to bottom alongside your own file.
+The example manifest is [`reference-profile.yaml`](./reference-profile.yaml). It deploys five addons
+(helm-controller, cert-manager, Prometheus, Istio, Headlamp) onto a cluster built from the
+`builtin-generic-v3.7.0` ClusterClass, with OIDC authentication and dedicated node volumes. Open it
+alongside this guide.
 
-**Audience.** Platform engineers and Kubernetes administrators deploying VKS. Kubernetes
-fluency is assumed; VKS-specific concepts are explained.
+That profile is deliberately permissive in places so the platform can be explored without high
+availability or admission control restricting what can run. It is a demonstration, not a baseline.
+[Section 1.3](#13-decisions-you-cannot-revisit) lists what to settle before you apply anything, and
+[Appendix A](#appendix-a-a-production-starting-point) gives a hardened version you can deploy.
 
-**On accuracy.** Schema constraints, defaults, and platform behaviour in this document were
-verified against a live VKS 3.7 environment — `builtin-generic-v3.7.0` and its addon catalogue.
-Statements that are environment-specific are marked, and every command shown is one you can run
-to confirm the behaviour yourself rather than take on trust. Where something depends on your
-release or licensing, it is listed in [Appendix C](#appendix-c--verify-for-your-environment)
-rather than asserted.
+**Audience.** Platform engineers and Kubernetes administrators. Kubernetes fluency is assumed;
+VKS-specific concepts are explained.
 
-**Tooling.** Every command in this document runs with **`kubectl` and a POSIX shell only** —
-output is shaped with `-o jsonpath`, `-o custom-columns`, `--show-labels`, and standard utilities
-(`awk`, `sort`, `diff`). No `jq`, `yq`, or Python is required. Where a JSON formatter would merely
-improve readability, it is noted as optional.
+**Tooling.** Every command needs only `kubectl` and a POSIX shell. Output is shaped with
+`-o jsonpath`, `-o custom-columns`, `--show-labels`, and standard utilities. No `jq`, `yq`, or
+Python.
 
-**Conventions.**
+**Verification.** Schema constraints, defaults, and platform behaviour were checked against a
+running VKS 3.7 environment. Where something depends on your release or licensing, it is listed in
+[Appendix E](#appendix-e-check-these-against-your-own-environment) rather than asserted.
 
-| Placeholder | Meaning |
+**Placeholders.**
+
+| Token | Meaning |
 | --- | --- |
-| `<VSPHERE_NAMESPACE>` | Your vSphere Namespace on the Supervisor — the `metadata.namespace` of every object except the in-cluster ones in Appendix B |
-| `<CLUSTER_NAME>` | Your workload cluster name. The examples use `workload-vsphere-vks2`. |
-| `<STORAGE_CLASS>` | A StorageClass associated with your vSphere Namespace |
-| `<OIDC_CLIENT_ID>` | The OAuth 2.0 / OIDC client ID from your identity provider |
-| `<OIDC_CLIENT_SECRET>` | The corresponding client secret — never commit the real value |
-| `headlamp.k8s.example.com` | The FQDN you will publish for the Headlamp UI |
-
----
-
-## Read this first: this is a reference profile, not a production baseline
-
-The manifest annotated here is a **working reference** — ideal for learning the object model and
-for a proof of concept. Several values are deliberately permissive for a lab and should change
-before production. Nothing here is broken; it is simply scoped for dev/test.
-
-| Value | Fine for dev/test because | Production choice |
-| --- | --- | --- |
-| `controlPlane.replicas: 1` | Halves the footprint; a lab can tolerate API downtime. | **`3`** — etcd quorum and HA |
-| `vmClass: best-effort-*` | Higher density on a shared lab cluster. | **`guaranteed-*`** — reserved CPU/memory |
-| `podSecurityStandard: privileged` | Nothing is blocked, so nothing distracts from learning the platform. | **`enforce: baseline`** cluster-wide, `restricted` per namespace ([7.7.3](#773-securitypodsecuritystandard)) |
-| `*Version: latest` (PSS) | Convenient; upgrade drift is irrelevant in a lab. | Pin explicitly (e.g. `v1.36`) |
-| `pilot.replicas: 1`, ingress `minReplicas: 1` | One of each is enough to demonstrate routing. | **`2`** minimum for both |
-| `oidc.clientSecret` inline | Fast to iterate on. | A referenced Secret |
-| Self-signed Headlamp TLS (addon default) | Browser warnings are tolerable in a lab. | A certificate from a **trusted CA** |
-| Pod CIDR `/20` | 16 node blocks is plenty for a small lab. | **`/16`** — immutable, so decide now ([7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare)) |
-| `claims.?email_verified.orValue(true)` | — | **`orValue(false)`** — the rule as written fails open ([Pitfall 1](#1-a-claim-validation-rule-that-fails-open)) |
-
-A hardened, copy-pasteable version of the whole manifest is in
-[Appendix A](#appendix-a--production-baseline-manifest).
-
-> **The one item on that list that is not a dev/prod trade-off** is the
-> `orValue(true)` claim validation rule. It is a logic error in either environment — see
-> [Pitfall 1](#1-a-claim-validation-rule-that-fails-open).
+| `<VSPHERE_NAMESPACE>` | Your vSphere Namespace on the Supervisor |
+| `<CLUSTER_NAME>` | Your workload cluster name |
+| `<STORAGE_CLASS>` | A StorageClass associated with that namespace |
+| `<OIDC_CLIENT_ID>`, `<OIDC_CLIENT_SECRET>` | Credentials from your identity provider |
+| `headlamp.k8s.example.com`, `api.k8s.example.com`, `idp.example.com` | Names you will publish in DNS |
 
 ---
 
 ## Contents
 
-Numbered sections build on each other and are best read in order. The appendices are reference
-material you can jump to directly. Each section opens with what it covers and why it matters.
-
-- [Read this first: this is a reference profile, not a production baseline](#read-this-first-this-is-a-reference-profile-not-a-production-baseline)
-- [The reference profile](#the-reference-profile)
-    - [What is in it](#what-is-in-it)
-    - [The shape of it](#the-shape-of-it)
-    - [How to read this document alongside it](#how-to-read-this-document-alongside-it)
-- [1. Prerequisites](#1-prerequisites)
-    - [Getting CLI access to the Supervisor](#getting-cli-access-to-the-supervisor)
-    - [Platform prerequisites](#platform-prerequisites)
-- [2. Choosing a Kubernetes release: the `kr` object](#2-choosing-a-kubernetes-release-the-kr-object)
-    - [The object](#the-object)
-    - [Selecting one](#selecting-one)
+- [1. Before you start](#1-before-you-start)
+    - [1.1 CLI access and contexts](#11-cli-access-and-contexts)
+    - [1.2 Platform prerequisites](#12-platform-prerequisites)
+    - [1.3 Decisions you cannot revisit](#13-decisions-you-cannot-revisit)
+    - [1.4 What to change before production](#14-what-to-change-before-production)
+- [2. Choosing a Kubernetes release](#2-choosing-a-kubernetes-release)
     - [Which one to pick](#which-one-to-pick)
-    - [Related objects](#related-objects)
-- [3. What VKS installs for you](#3-what-vks-installs-for-you)
-- [4. How addons work — the object model](#4-how-addons-work--the-object-model)
-    - [The chain](#the-chain)
-    - [How addons are delivered: Carvel packages](#how-addons-are-delivered-carvel-packages)
-    - [Apply order does not matter](#apply-order-does-not-matter)
-    - [The name convention is a defaulting mechanism](#the-name-convention-is-a-defaulting-mechanism)
-    - [Verifying the whole stack in one command](#verifying-the-whole-stack-in-one-command)
-- [5. Discovering addons and their value schemas](#5-discovering-addons-and-their-value-schemas)
-    - [With the `vcf` CLI](#with-the-vcf-cli)
-    - [With `kubectl`, against the Supervisor](#with-kubectl-against-the-supervisor)
-- [6. The addons, annotated](#6-the-addons-annotated)
+- [3. What the platform already gives you](#3-what-the-platform-already-gives-you)
+- [4. How addons are delivered](#4-how-addons-are-delivered)
+    - [The naming rule](#the-naming-rule)
+- [5. Reading an addon's value schema](#5-reading-an-addons-value-schema)
+- [6. The addon stack](#6-the-addon-stack)
     - [6.1 helm-controller](#61-helm-controller)
     - [6.2 cert-manager](#62-cert-manager)
     - [6.3 Prometheus](#63-prometheus)
-    - [6.4 Istio — deployed for L4/L7, not as a service mesh](#64-istio--deployed-for-l4l7-not-as-a-service-mesh)
+    - [6.4 Istio](#64-istio)
     - [6.5 Headlamp](#65-headlamp)
-    - [6.6 Additional addons worth considering](#66-additional-addons-worth-considering)
-- [7. The `Cluster` object, annotated](#7-the-cluster-object-annotated)
-    - [7.1 Metadata and cluster networking](#71-metadata-and-cluster-networking)
-    - [7.1.1 Pod CIDR sizing: node blocks, `maxPods`, and the upgrade spare](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare)
-    - [7.2 Topology and ClusterClass](#72-topology-and-clusterclass)
-    - [7.3 Control plane](#73-control-plane)
-    - [7.4 `storageClass`](#74-storageclass)
-    - [7.5 `vmClass` — use `guaranteed-*` for production](#75-vmclass--use-guaranteed--for-production)
-    - [7.6 `volumes` — dedicated containerd and kubelet disks](#76-volumes--dedicated-containerd-and-kubelet-disks)
-    - [7.7 `kubernetes` — certificates, etcd, security, and API server](#77-kubernetes--certificates-etcd-security-and-api-server)
-    - [7.8 `bootstrapAddons` — CNI selection](#78-bootstrapaddons--cni-selection)
-    - [7.9 `vsphereOptions` — persistent volume storage classes](#79-vsphereoptions--persistent-volume-storage-classes)
-    - [7.10 `osConfiguration` — NTP and SSH banner](#710-osconfiguration--ntp-and-ssh-banner)
-    - [7.11 `version`](#711-version)
-    - [7.12 `workers.machineDeployments` — the node pool](#712-workersmachinedeployments--the-node-pool)
-    - [7.13 3.7 variables not used in the sample](#713-37-variables-not-used-in-the-sample)
-- [8. Cluster decisions you cannot change later](#8-cluster-decisions-you-cannot-change-later)
-- [9. Cross-object dependency map](#9-cross-object-dependency-map)
-- [10. Consolidated pitfalls](#10-consolidated-pitfalls)
-    - [1. A claim validation rule that fails open](#1-a-claim-validation-rule-that-fails-open)
-    - [2. An `AddonConfig` that is silently skipped](#2-an-addonconfig-that-is-silently-skipped)
-    - [3. OIDC client secret in plaintext](#3-oidc-client-secret-in-plaintext)
-    - [4. Pod CIDR exhaustion blocks upgrades](#4-pod-cidr-exhaustion-blocks-upgrades)
-    - [5. Missing RBAC after OIDC login](#5-missing-rbac-after-oidc-login)
-    - [6. A Gateway with no controller](#6-a-gateway-with-no-controller)
-    - [7. Hostname, DNS, and redirect URI drift](#7-hostname-dns-and-redirect-uri-drift)
-    - [8. Prometheus operator with no `Prometheus` CR](#8-prometheus-operator-with-no-prometheus-cr)
-    - [9. The IdP emits no `groups` claim](#9-the-idp-emits-no-groups-claim)
-    - [10. Pod Security versions pinned to `latest`](#10-pod-security-versions-pinned-to-latest)
-    - [11. StorageClass or VM class not associated with the vSphere Namespace](#11-storageclass-or-vm-class-not-associated-with-the-vsphere-namespace)
-    - [12. `best-effort` VM classes in production](#12-best-effort-vm-classes-in-production)
-    - [13. Clock skew breaks OIDC intermittently](#13-clock-skew-breaks-oidc-intermittently)
-    - [14. etcd read-only after exceeding its quota](#14-etcd-read-only-after-exceeding-its-quota)
-    - [15. Istio `pilot.replicas` fighting its own HPA](#15-istio-pilotreplicas-fighting-its-own-hpa)
-    - [16. `maxPods` raised without matching node resources](#16-maxpods-raised-without-matching-node-resources)
-- [11. Verification and troubleshooting](#11-verification-and-troubleshooting)
-    - [Layer 1 — Supervisor: does the cluster exist?](#layer-1--supervisor-does-the-cluster-exist)
-    - [Layer 2 — Addons: installed, bound, and ready?](#layer-2--addons-installed-bound-and-ready)
-    - [Layer 3 — Guest cluster: did the packages reconcile?](#layer-3--guest-cluster-did-the-packages-reconcile)
-    - [Layer 4 — Istio and the ingress gateway](#layer-4--istio-and-the-ingress-gateway)
-    - [Layer 5 — Gateway API, Headlamp, and TLS](#layer-5--gateway-api-headlamp-and-tls)
-    - [Layer 6 — Storage](#layer-6--storage)
-    - [Layer 7 — Identity: what username does the API server see?](#layer-7--identity-what-username-does-the-api-server-see)
-    - [Layer 8 — Observability: is anything actually evaluating rules?](#layer-8--observability-is-anything-actually-evaluating-rules)
-    - [Layer 9 — Pod CIDR headroom](#layer-9--pod-cidr-headroom)
-- [12. Day-2 lifecycle](#12-day-2-lifecycle)
-    - [Upgrade sequencing](#upgrade-sequencing)
-    - [Which changes replace nodes](#which-changes-replace-nodes)
-    - [Addon lifecycle](#addon-lifecycle)
-    - [Certificate rotation](#certificate-rotation)
-    - [etcd growth](#etcd-growth)
-    - [Tightening Pod Security](#tightening-pod-security)
-    - [OIDC and hostname changes](#oidc-and-hostname-changes)
-    - [Backup and restore](#backup-and-restore)
-- [Appendix A — Production baseline manifest](#appendix-a--production-baseline-manifest)
-- [Appendix B — Additional objects and hardening](#appendix-b--additional-objects-and-hardening)
+    - [6.6 The rest of the catalogue](#66-the-rest-of-the-catalogue)
+- [7. The cluster](#7-the-cluster)
+    - [7.1 Pod and service networking](#71-pod-and-service-networking)
+    - [7.2 ClusterClass and version](#72-clusterclass-and-version)
+    - [7.3 Node sizing](#73-node-sizing)
+    - [7.4 Control plane](#74-control-plane)
+    - [7.5 Worker pools](#75-worker-pools)
+    - [7.6 Pod Security](#76-pod-security)
+    - [7.7 Identity: OIDC and RBAC](#77-identity-oidc-and-rbac)
+    - [7.8 Platform settings](#78-platform-settings)
+- [8. Couplings that must agree](#8-couplings-that-must-agree)
+- [9. Operating the cluster](#9-operating-the-cluster)
+    - [9.1 Health checks after deployment](#91-health-checks-after-deployment)
+    - [9.2 Upgrades](#92-upgrades)
+    - [9.3 Ongoing maintenance](#93-ongoing-maintenance)
+    - [9.4 Symptom lookup](#94-symptom-lookup)
+- [Appendix A: A production starting point](#appendix-a-a-production-starting-point)
+- [Appendix B: In-cluster companion objects](#appendix-b-in-cluster-companion-objects)
     - [B.1 RBAC for OIDC identities](#b1-rbac-for-oidc-identities)
-    - [B.2 Trusted TLS for the Headlamp Gateway](#b2-trusted-tls-for-the-headlamp-gateway)
-    - [B.3 A `Prometheus` instance via the operator](#b3-a-prometheus-instance-via-the-operator)
-    - [B.4 Further hardening worth considering](#b4-further-hardening-worth-considering)
-- [Appendix C — Verify for your environment](#appendix-c--verify-for-your-environment)
-- [Appendix D — Optional integrations requiring environment-specific setup](#appendix-d--optional-integrations-requiring-environment-specific-setup)
-    - [D.1 Backup and restore (`velero`)](#d1-backup-and-restore-velero)
-    - [D.2 Log forwarding (`fluent-bit`)](#d2-log-forwarding-fluent-bit)
-    - [D.3 DNS automation (`external-dns`)](#d3-dns-automation-external-dns)
-- [Appendix E — Inspecting a Kubernetes release (`kr`)](#appendix-e--inspecting-a-kubernetes-release-kr)
-    - [E.1 `.spec.kubernetes` — core control-plane components](#e1-speckubernetes--core-control-plane-components)
-    - [E.2 `.spec.bootstrapPackages` — the platform addons pinned to the release](#e2-specbootstrappackages--the-platform-addons-pinned-to-the-release)
-    - [E.3 `.spec.osImages` and the `osimage` object](#e3-specosimages-and-the-osimage-object)
-    - [E.4 A pre-upgrade change report](#e4-a-pre-upgrade-change-report)
-    - [E.5 Command reference](#e5-command-reference)
-- [Summary — the short list](#summary--the-short-list)
-    - [Before you apply](#before-you-apply)
-    - [Fix before production](#fix-before-production)
-    - [Addons to consider](#addons-to-consider)
-    - [Keep — these parts of the sample are good practice](#keep--these-parts-of-the-sample-are-good-practice)
-    - [Four points worth being explicit about](#four-points-worth-being-explicit-about)
+    - [B.2 A trusted certificate for the UI](#b2-a-trusted-certificate-for-the-ui)
+    - [B.3 A Prometheus instance](#b3-a-prometheus-instance)
+    - [B.4 Worth adding beyond this](#b4-worth-adding-beyond-this)
+- [Appendix C: Integrations that need an external system](#appendix-c-integrations-that-need-an-external-system)
+    - [C.1 Backup and restore (`velero`)](#c1-backup-and-restore-velero)
+    - [C.2 Log forwarding (`fluent-bit`)](#c2-log-forwarding-fluent-bit)
+    - [C.3 DNS automation (`external-dns`)](#c3-dns-automation-external-dns)
+- [Appendix D: Reading a Kubernetes release object](#appendix-d-reading-a-kubernetes-release-object)
+    - [D.1 Core components](#d1-core-components)
+    - [D.2 Bootstrap packages](#d2-bootstrap-packages)
+    - [D.3 OS images](#d3-os-images)
+    - [D.4 A pre-upgrade change report](#d4-a-pre-upgrade-change-report)
+    - [D.5 Command reference](#d5-command-reference)
+- [Appendix E: Check these against your own environment](#appendix-e-check-these-against-your-own-environment)
 
 ---
 
-## The reference profile
+## 1. Before you start
 
-> **What this covers.** The single manifest that the rest of this document annotates — what is in it,
-> why each piece is there, and where to find the full file.
->
-> **Why it matters.** Every section from 6 onward explains fields *of this manifest*. Seeing the whole
-> artifact first turns the document into a walkthrough rather than a list of disconnected settings.
+Four things to get out of the way: access, prerequisites, the handful of choices that are permanent,
+and the settings that separate a lab from production.
 
-This document is not a survey of options — it annotates **one complete, working manifest**, field by
-field. Knowing what that manifest contains before you start makes the rest of the document read as a
-walkthrough rather than a list of disconnected settings.
+### 1.1 CLI access and contexts
 
-**The full manifest lives alongside this document as [`reference-profile.yaml`](./reference-profile.yaml).**
-It carries the same values discussed here, with a comment block above each object explaining what it
-is and why it is in the stack. Open it in a second window and read the two together.
-
-> **It is a learning and demonstration profile, not a deployable baseline.** Several values are
-> deliberately permissive so the platform can be explored without HA or admission control in the way
-> — see [Read this first](#read-this-first-this-is-a-reference-profile-not-a-production-baseline) for
-> the full list, and [Appendix A](#appendix-a--production-baseline-manifest) for the hardened
-> counterpart.
-
-### What is in it
-
-Ten objects: five addons (each an `AddonInstall`, four with a matching `AddonConfig`) and the
-`Cluster` itself. All ten live in your **vSphere Namespace on the Supervisor**.
-
-| # | Object | What it does | Why it is in the profile | Annotated in |
-| --- | --- | --- | --- | --- |
-| 1 | `AddonInstall` + `AddonConfig` **helm-controller** | Declarative Helm chart lifecycle management inside the cluster | A day-2 capability for *your own* charts. Notably **not** a prerequisite for the others. | [6.1](#61-helm-controller) |
-| 2 | `AddonInstall` **cert-manager** | Certificate issuance and rotation | A real dependency — Headlamp uses it to terminate TLS on its Gateway. Ships with **no** `AddonConfig`, which is legal and deliberate. | [6.2](#62-cert-manager) |
-| 3 | `AddonInstall` + `AddonConfig` **prometheus** | Exporters plus the prometheus-operator | The operator-managed pattern: you declare your own `Prometheus` CR instead of accepting a packaged server. | [6.3](#63-prometheus) |
-| 4 | `AddonInstall` + `AddonConfig` **istio** | L4/L7 ingress gateway and Gateway API controller | The cluster's north-south entry point. **Not** deployed as a service mesh — no sidecars. | [6.4](#64-istio--deployed-for-l4l7-not-as-a-service-mesh) |
-| 5 | `AddonInstall` + `AddonConfig` **headlamp** | A web UI, exposed via Gateway API and authenticated with OIDC | The human-facing entry point, and the reason the API server carries an OIDC configuration. | [6.5](#65-headlamp) |
-| 6 | `Cluster` | The workload cluster, on the `builtin-generic-v3.7.0` ClusterClass | Networking, node shape, storage, Pod Security, and the OIDC trust that makes the UI login work. | [7](#7-the-cluster-object-annotated) |
-
-### The shape of it
-
-An outline of all ten objects and every `Cluster` variable, so nothing below comes as a surprise:
-
-```text
-── Addons (vSphere Namespace on the Supervisor) ─────────────────────────────
-AddonInstall/cluster-helm-controller          → addonRef: helm-controller
-AddonConfig/<cluster>-helm-controller           priorityClassName × 2
-AddonInstall/cluster-cert-manager             → addonRef: cert-manager
-AddonInstall/cluster-prom                     → addonRef: prometheus
-AddonConfig/<cluster>-prometheus                deploycomponents × 6
-AddonInstall/cluster-istio                    → addonRef: istio
-AddonConfig/<cluster>-istio                     namespace, ambientMode, istioCNI,
-                                                gateways.ingress, pilot, meshConfig
-AddonInstall/cluster-headlamp                 → addonRef: headlamp
-AddonConfig/<cluster>-headlamp                  hostname, gatewayApi, oidc
-
-── Cluster ──────────────────────────────────────────────────────────────────
-Cluster/<cluster>
-  clusterNetwork          pods /20 · services /20 · serviceDomain
-  topology.classRef       builtin-generic-v3.7.0
-  topology.controlPlane   replicas 1 · vmClass override · OS image annotation
-  topology.variables
-    storageClass          node disks
-    vmClass               worker node shape
-    volumes               /var/lib/containerd · /var/lib/kubelet
-    kubernetes            certificateRotation · etcdConfiguration · security
-                          apiServerConfiguration (incl. OIDC) · kubeletConfiguration
-    bootstrapAddons       cniRef: antrea
-    vsphereOptions        PV storage classes
-    osConfiguration       ntp · sshd banner
-  topology.version        v1.36.1---vmware.4-vkr.5
-  topology.workers        one machineDeployment, autoscaler-annotated
-```
-
-Three ClusterClass variables are available but **not** used by this profile — `node`,
-`resourceConfiguration`, and the deprecated `kubeAPIServerFQDNs`. Two of them are worth adding;
-see [7.13](#713-37-variables-not-used-in-the-sample).
-
-### How to read this document alongside it
-
-| If you want to… | Go to |
-| --- | --- |
-| Understand one field | [6](#6-the-addons-annotated) for addons, [7](#7-the-cluster-object-annotated) for the `Cluster` |
-| Know what you cannot change later | [8](#8-cluster-decisions-you-cannot-change-later) |
-| See which values must agree with each other | [9](#9-cross-object-dependency-map) |
-| Know what will bite you | [10](#10-consolidated-pitfalls) |
-| Deploy something production-ready instead | [Appendix A](#appendix-a--production-baseline-manifest) |
-
-
----
-
-## 1. Prerequisites
-
-> **What this covers.** Getting `kubectl` access to the Supervisor, and confirming that the VM
-> classes, storage policies, and Kubernetes release the manifest references actually exist.
->
-> **Why it matters.** These objects are accepted by the API server and *then* stall. An unchecked
-> prerequisite does not fail at apply time — it surfaces later as a machine that never provisions or
-> a PVC that pends forever, with a thin error surface either way.
-
-Objects that reference resources not associated with your vSphere Namespace do not fail fast —
-they are accepted by the API server and then stall, often with a thin error surface. These
-checks are cheap and save real debugging time.
-
-### Getting CLI access to the Supervisor
-
-Everything in this document is driven through `kubectl` against the **Supervisor**, so start here.
-The `vcf` CLI creates the context and writes the kubeconfig for you:
+Everything here runs through `kubectl` against the Supervisor. The `vcf` CLI creates the context and
+writes the kubeconfig:
 
 ```bash
-# Authenticate to the Supervisor and create a context
-vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN_OR_IP> --type k8s
+vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN> --type k8s
 
-# If the Supervisor uses a private or enterprise CA, supply the bundle
-vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN_OR_IP> \
+# if the Supervisor sits behind a private or enterprise CA
+vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN> \
   --ca-certificate /path/to/ca-cert --type k8s
 ```
 
-That produces one context per vSphere Namespace you can reach, plus one per workload cluster:
+You end up with one context per vSphere Namespace you can reach, and one per workload cluster. Two
+of them matter, and confusing them is the most common early stumble:
 
-```bash
-kubectl config get-contexts
-```
-
-```
-CURRENT   NAME                          CLUSTER
-          supervisor                    supervisor:10.0.0.6        ← Supervisor, no namespace
-*         supervisor:<VSPHERE_NAMESPACE> supervisor:10.0.0.6       ← Supervisor, namespace-scoped
-          vks                           vks:10.0.0.6
-          vks:<CLUSTER_NAME>            vks:10.0.0.12              ← inside the workload cluster
-```
-
-**Two contexts matter, and mixing them up is the most common early confusion:**
-
-| Context | Use it for |
+| Context | What lives there |
 | --- | --- |
-| **Supervisor**, scoped to your vSphere Namespace | `Cluster`, `AddonInstall`, `AddonConfig`, `ClusterAddon`, `kr`, `osimage`, `virtualmachineclass` — everything you *author* |
-| **Workload cluster** | `pkgi`, pods, `Gateway`, RBAC, `Prometheus` CRs — everything *inside* the cluster |
+| Supervisor, scoped to your vSphere Namespace | `Cluster`, `AddonInstall`, `AddonConfig`, `ClusterAddon`, `kr`, `osimage`, `virtualmachineclass`. Everything you author. |
+| The workload cluster | `pkgi`, pods, `Gateway`, RBAC, `Prometheus` CRs. Everything that runs inside. |
 
 ```bash
 kubectl config use-context supervisor:<VSPHERE_NAMESPACE>    # authoring
-kubectl config use-context vks:<CLUSTER_NAME>                # in-cluster verification
+kubectl config use-context vks:<CLUSTER_NAME>                # in-cluster checks
 ```
 
-Throughout this document, commands are run against the **Supervisor** unless a section says
-otherwise — [section 5](#5-discovering-addons-and-their-value-schemas) and
-[Layer 3](#layer-3--guest-cluster-did-the-packages-reconcile) onward call out the switch explicitly.
+Commands in this guide run against the Supervisor unless stated otherwise.
 
-> **This is also your recovery path.** `vcf context create` regenerates a working kubeconfig at any
-> time, so a failure of the external identity provider used for
-> [OIDC](#776-apiserverconfigurationextraauthentication--oidc) does not lock you out of the cluster.
+One useful consequence: `vcf context create` regenerates a working kubeconfig whenever you need one,
+so an outage at your identity provider does not lock you out of a cluster that uses OIDC.
 
-### Platform prerequisites
+### 1.2 Platform prerequisites
 
-| # | Requirement | Verify with |
-| --- | --- | --- |
-| 1 | **CLI access to the Supervisor**, with a context selected. | `kubectl config current-context` |
-| 2 | A **vSphere Namespace** exists and you have permissions on it. This is `metadata.namespace` throughout. | `kubectl get ns <VSPHERE_NAMESPACE>` |
-| 3 | **VM classes** are associated with the namespace. | `kubectl get virtualmachineclass` |
-| 4 | **Storage policies** are associated with the namespace. | `kubectl describe ns <VSPHERE_NAMESPACE>` — the storage quota lists every associated class (see below) |
-| 5 | A **Kubernetes release** matching your target version is available and compatible. | `kubectl get kr` — see [section 2](#2-choosing-a-kubernetes-release-the-kr-object) |
-| 6 | The **ClusterClass** you intend to use is present and its variables are ready. | `kubectl get clusterclass -n vmware-system-vks-public` |
-| 7 | **OS images** are synced so the requested image resolves. | `kubectl get osimage` — see [Appendix E.3](#e3-specosimages-and-the-osimage-object) |
-| 8 | The **`vcf` CLI** is available, for addon discovery. | `vcf version` |
+VKS accepts objects that reference resources it cannot find, and only stalls later. A `Cluster` whose
+VM class is not available to the namespace is admitted happily and then never provisions a machine.
+Checking first is cheap.
 
-**The storage-class discovery trick.** `StorageClass` is cluster-scoped, so a namespace user
-usually cannot list it. But the namespace's storage quota names every associated class, which is
-exactly the list you need:
+| Requirement | Check |
+| --- | --- |
+| CLI access, correct context | `kubectl config current-context` |
+| The vSphere Namespace exists and you have rights on it | `kubectl get ns <VSPHERE_NAMESPACE>` |
+| VM classes are associated with the namespace | `kubectl get virtualmachineclass` |
+| Storage policies are associated with the namespace | `kubectl describe ns <VSPHERE_NAMESPACE>` |
+| A suitable Kubernetes release is available | `kubectl get kr` ([section 2](#2-choosing-a-kubernetes-release)) |
+| The ClusterClass is present and its variables are ready | `kubectl get clusterclass -n vmware-system-vks-public` |
+| OS images are synced | `kubectl get osimage` ([Appendix D](#appendix-d-reading-a-kubernetes-release-object)) |
+| The `vcf` CLI is installed | `vcf version` |
+
+StorageClass is cluster-scoped, so a namespace user usually cannot list it. The namespace's storage
+quota names every class available to you, which is the list you actually need:
 
 ```bash
 kubectl describe ns <VSPHERE_NAMESPACE> | grep storageclass
-# → vsan-esa-default-policy-raid5.storageclass.storage.k8s.io/requests.storage   127Gi   ...
+# vsan-esa-default-policy-raid5.storageclass.storage.k8s.io/requests.storage   127Gi   ...
 ```
 
-The prefix before `.storageclass.storage.k8s.io` is the StorageClass name to use in the
-manifest. If a class you intend to use is not in this output, **it is not available to this
-namespace** and every reference to it will fail later, not now.
+The part before `.storageclass.storage.k8s.io` is the name to put in the manifest.
 
-> **The most common conceptual error in VKS.** `metadata.namespace` on these objects is a
-> **vSphere Namespace on the Supervisor**, not a namespace inside the workload cluster. The
-> manifest contains both kinds: `metadata.namespace: <VSPHERE_NAMESPACE>` is a Supervisor
-> namespace, while `spec.values.istio.namespace: istio-system` is a namespace *inside the
-> workload cluster*. Different API servers entirely.
+One piece of terminology, because it causes more confusion than anything else in VKS: the
+`metadata.namespace` on these objects is a **vSphere Namespace on the Supervisor**, not a namespace
+inside the workload cluster. The reference profile contains both kinds. `metadata.namespace` is a
+Supervisor namespace; `spec.values.istio.namespace: istio-system` is a namespace in the guest
+cluster. Different API servers entirely.
+
+### 1.3 Decisions you cannot revisit
+
+Most of the manifest can be edited later. These cannot, and correcting one means building a new
+cluster and migrating workloads.
+
+| Decision | Field | Where it is discussed |
+| --- | --- | --- |
+| Pod network size | `clusterNetwork.pods.cidrBlocks` | [7.1](#71-pod-and-service-networking) |
+| Service network size | `clusterNetwork.services.cidrBlocks` | [7.1](#71-pod-and-service-networking) |
+| CNI | `bootstrapAddons.cniRef` | [7.8](#78-platform-settings) |
+| Cluster DNS domain | `clusterNetwork.serviceDomain` | [7.1](#71-pod-and-service-networking) |
+| Cluster name | `metadata.name` | Embedded in every addon selector |
+| Per-node pod block size | Node CIDR mask | [7.1](#71-pod-and-service-networking) |
+
+Two more are technically changeable but expensive enough to treat the same way: `volumes` capacity,
+because resizing rebuilds every node in the pool, and moving `controlPlane.replicas` from 1 to 3,
+which is a rolling change you need a window for.
+
+Of these, pod network size is the one people get wrong. Read [7.1](#71-pod-and-service-networking)
+before you pick a prefix.
+
+### 1.4 What to change before production
+
+The reference profile makes several choices that suit a lab. None of them is a mistake in that
+context; all of them should change before real workloads arrive.
+
+| Setting in the profile | Production choice |
+| --- | --- |
+| `controlPlane.replicas: 1` | `3`, for etcd quorum |
+| `vmClass: best-effort-*` | `guaranteed-*` |
+| `podSecurityStandard: privileged` | `enforce: baseline`, with `restricted` per namespace |
+| PSS `*Version: latest` | An explicit version, such as `v1.36` |
+| `pilot.replicas: 1`, ingress `minReplicas: 1` | `2` for both |
+| `oidc.clientSecret` inline | A referenced Secret |
+| Self-signed UI certificate | A certificate from a trusted CA |
+| Pod CIDR `/20` | `/16` |
 
 ---
 
-## 2. Choosing a Kubernetes release: the `kr` object
+## 2. Choosing a Kubernetes release
 
-> **What this covers.** How to list the Kubernetes releases your Supervisor offers, read their status
-> columns, and pick a valid one.
->
-> **Why it matters.** `topology.version` is a single string that either matches a release or silently
-> never reconciles. The release you choose also pins your etcd version, your CNI version, and which
-> node OS images you may select — so this is a bigger decision than the version number suggests.
+`topology.version` takes a single string. Get it wrong and the cluster is admitted and then never
+reconciles, so it is worth two minutes to look up rather than copy.
 
-`topology.version` must exactly match a Kubernetes release the Supervisor offers. This is a
-frequent source of clusters that are accepted and then never reconcile, and it is entirely
-avoidable — the available releases are queryable.
-
-### The object
-
-VKS models each available Kubernetes version as a cluster-scoped **`KubernetesRelease`**
-(`kubernetes.vmware.com/v1alpha1`, short name **`kr`**):
+VKS models each available version as a cluster-scoped `KubernetesRelease`, short name `kr`:
 
 ```bash
 kubectl get kr
 ```
 
 ```
-NAME                              VERSION                           READY   COMPATIBLE   DEACTIVATED BY   CREATED
-v1.35.6---vmware.2-vkr.3          v1.35.6+vmware.2-vkr.3            True    True                          61d
-v1.36.1---vmware.4-vkr.5          v1.36.1+vmware.4-vkr.5            True    True                          5d
-v1.36.2---vmware.2-vkr.3          v1.36.2+vmware.2-vkr.3            True    True                          2d
-v1.25.13---vmware.1-fips.1-tkg.1  v1.25.13+vmware.1-fips.1-tkg.1    False   False                         124d
+NAME                              VERSION                           READY   COMPATIBLE   DEACTIVATED BY
+v1.35.6---vmware.2-vkr.3          v1.35.6+vmware.2-vkr.3            True    True
+v1.36.1---vmware.4-vkr.5          v1.36.1+vmware.4-vkr.5            True    True
+v1.36.2---vmware.2-vkr.3          v1.36.2+vmware.2-vkr.3            True    True
+v1.25.13---vmware.1-fips.1-tkg.1  v1.25.13+vmware.1-fips.1-tkg.1    False   False
 ```
 
-An environment typically lists **many** releases, most of them historical. The list is not a
-menu — the status columns are.
+The list is long and mostly historical. The status columns are what narrow it:
 
-| Column | Meaning | Consequence |
-| --- | --- | --- |
-| `READY` | The release's artifacts (OS images, component packages) are present and usable. | `False` → the release cannot be deployed even though the object exists. |
-| `COMPATIBLE` | The release is compatible with **this Supervisor / VKS version**. | `False` → not a valid choice. This is what filters out legacy releases. |
-| `DEACTIVATED BY` | Names a policy or object that has explicitly disabled this release. | Non-empty → deliberately blocked, likely on purpose. Ask before overriding. |
+| Column | Meaning |
+| --- | --- |
+| `READY` | The release's artifacts (OS images, component packages) are present and usable |
+| `COMPATIBLE` | The release works with this Supervisor version. This is what rules out the legacy entries. |
+| `DEACTIVATED BY` | Names a policy that has explicitly disabled the release. Non-empty means someone blocked it on purpose. |
 
-**Only a release that is `READY=True` and `COMPATIBLE=True` with an empty `DEACTIVATED BY` is a
-valid `topology.version`.** In the environment this document was verified against, that reduced
-a long list to **13** usable releases.
-
-### Selecting one
+Only a release that is `READY=True`, `COMPATIBLE=True`, with nothing in `DEACTIVATED BY`, is a valid
+choice. In the environment used for this guide that reduced a long list to thirteen entries.
 
 ```bash
-# the only releases you should be choosing from — READY and COMPATIBLE are
-# columns 3 and 4 of the default output
 kubectl get kr --no-headers | awk '$3=="True" && $4=="True" {print $1}' | sort -V
 ```
 
-Then copy the **`NAME`**, not the `VERSION`, into `topology.version`:
+Copy the `NAME` into the manifest, not the `VERSION`:
 
 ```yaml
-    version: v1.36.1---vmware.4-vkr.5     # ← the kr NAME
+    version: v1.36.1---vmware.4-vkr.5
 ```
 
-> **The version used throughout this document is illustrative.** Any release that is `READY=True`
-> and `COMPATIBLE=True` in *your* environment is a valid choice — substitute whatever your version
-> policy selects. The point of this section is the selection *method*, not the specific string.
-
-| Field | Format | Use |
-| --- | --- | --- |
-| `kr` `NAME` | `v1.36.1---vmware.4-vkr.5` — **triple** dash | **This is what `topology.version` takes.** |
-| `kr` `VERSION` | `v1.36.1+vmware.4-vkr.5` — plus sign | The semver form. Appears in `Cluster.status` and `kubectl version`. |
-
-> **The `---` is not a typo and not interchangeable with the `+` form.** The triple dash is a
-> DNS-safe encoding of the `+` build separator, because the `+` is not legal in a Kubernetes
-> object name. Using the `+` form, or a single or double dash, produces a topology that never
-> reconciles.
+The two forms differ. `NAME` uses a triple dash; `VERSION` uses a plus sign and appears in
+`Cluster.status` and `kubectl version`. The triple dash is a DNS-safe encoding of the `+` build
+separator, which is not legal in a Kubernetes object name. A single dash, a double dash, or the `+`
+form all produce a topology that sits there doing nothing.
 
 ### Which one to pick
 
+The newest compatible release is not automatically the right one.
+
 | Consideration | Guidance |
 | --- | --- |
-| **Newest vs. proven** | The newest compatible release is not automatically the right one. Prefer a release you have validated, and stay within the support window. |
-| **Patch level** | Among releases of the same minor, prefer the highest patch you have validated — these carry CVE and bug fixes. |
-| **ClusterClass compatibility** | The Kubernetes version and the ClusterClass move together. Do not bump one independently. |
-| **Upgrade path** | **One minor version at a time.** Skipping minors is unsupported. Plan `1.35 → 1.36 → 1.37`, not `1.35 → 1.37`. |
-| **Fleet consistency** | Standardise on one release per environment tier. A fleet on five different patch levels is a support and troubleshooting burden with no upside. |
+| Patch level | Among releases of the same minor, prefer the highest patch you have validated. These carry CVE and bug fixes. |
+| Validation | Prefer a release you have run somewhere else first, and stay inside the support window. |
+| ClusterClass pairing | The Kubernetes version and the ClusterClass move together. Do not bump one on its own. |
+| Upgrade path | One minor version at a time. Skipping minors is unsupported. |
+| Fleet consistency | Standardise on one release per environment tier. Five patch levels across a fleet adds troubleshooting effort with no benefit. |
 
-> **To see what is actually inside a release** — component versions, the pinned platform addons, and
-> the OS images it offers — see [Appendix E](#appendix-e--inspecting-a-kubernetes-release-kr). That is
-> also where you test a `resolve-os-image` annotation before applying it.
+A release pins more than the Kubernetes version. It also fixes your etcd version, your CNI version,
+and which node OS images you may select. [Appendix D](#appendix-d-reading-a-kubernetes-release-object)
+shows how to read all of that out of the object, and includes a pre-upgrade diff worth running before
+any version change.
 
-### Related objects
-
-| Object | Purpose |
-| --- | --- |
-| `kr` / `kubernetesreleases` | The VKS-native release object. **Use this.** |
-| `tkr` / `tanzukubernetesreleases` | The older TKG-era equivalent, still present for compatibility. |
-| `clusterclass` | Defines the variable schema; version-paired with the release. |
-
-```bash
-# after deployment, confirm what the cluster actually landed on
-kubectl get cluster <CLUSTER_NAME> -n <VSPHERE_NAMESPACE> \
-  -o custom-columns='NAME:.metadata.name,CLUSTERCLASS:.spec.topology.classRef.name,VERSION:.status.version'
-```
+The version used throughout this guide is illustrative. Substitute whatever your own policy selects.
 
 ---
 
-## 3. What VKS installs for you
+## 3. What the platform already gives you
 
-> **What this covers.** The platform-managed addons a VKS cluster arrives with, before you declare
-> anything.
->
-> **Why it matters.** It stops you installing something you already have, and it explains two things
-> that otherwise look like magic: why the autoscaler annotations in the manifest are effective, and
-> why Gateway API works for Headlamp without you installing any CRDs.
-
-Before adding anything, know what is already there. A VKS 3.7 cluster arrives with a set of
-platform-managed addons you do not declare — so some of what you might reach for is already
-running.
+A VKS cluster arrives with a set of addons you do not declare. Knowing what they are saves you
+installing something twice.
 
 ```bash
-# lists platform-managed and your own addons together
 kubectl get clusteraddon -n <VSPHERE_NAMESPACE>
 ```
 
-`ClusterAddon` is the platform-created object that joins a cluster to an addon and its resolved
-release; [section 4](#4-how-addons-work--the-object-model) covers it and the rest of the addon object
-model. For now it is simply the fastest way to see what a fresh cluster already has.
+`ClusterAddon` is a platform-created object joining a cluster to an addon and its resolved release;
+[section 4](#4-how-addons-are-delivered) covers it properly. For now it is the quickest way to see
+what a fresh cluster has.
 
-| Auto-installed | What it provides |
+| Installed for you | Provides |
 | --- | --- |
-| **antrea** (or your chosen CNI) | Pod networking and NetworkPolicy |
-| **vsphere-cpi** | Cloud provider integration — node lifecycle, LoadBalancer services |
-| **vsphere-pv-csi** | Persistent volume provisioning from vSphere storage |
-| **cluster-autoscaler** | **Already present** — this is why the machine-deployment autoscaler annotations work |
-| **gateway-api** | **The Gateway API CRDs** — so `gatewayApi.enabled: true` has something to bind to |
-| **metrics-server** | Resource metrics for `kubectl top` and HPA |
-| **pinniped** / **guest-cluster-auth-service** | Cluster authentication plumbing |
-| **secretgen-controller** | Carvel secret generation and export |
-| **carvel-repo** | The package repository the addons are pulled from |
-| **vks-static-resources** | Version-matched static platform resources |
+| antrea, or your chosen CNI | Pod networking and NetworkPolicy |
+| vsphere-cpi | Cloud provider integration: node lifecycle, LoadBalancer services |
+| vsphere-pv-csi | Persistent volume provisioning from vSphere storage |
+| cluster-autoscaler | Node pool scaling |
+| gateway-api | The Gateway API CRDs |
+| metrics-server | Resource metrics for `kubectl top` and HPA |
+| pinniped, guest-cluster-auth-service | Cluster authentication plumbing |
+| secretgen-controller | Carvel secret generation and export |
+| carvel-repo | The package repository addons are pulled from |
+| vks-static-resources | Version-matched platform resources |
 
-Two of these resolve questions people routinely ask:
+Two of those answer questions that come up constantly. The Gateway API CRDs are already present, so
+`gatewayApi.enabled: true` has something to bind to without you installing anything. And the Cluster
+Autoscaler is already running, which is what makes the machine-deployment scaling annotations in
+[7.5](#75-worker-pools) effective rather than decorative.
 
-- **You do not need to install the Gateway API CRDs.** They arrive with the platform. Confirm:
-  `kubectl get crd | grep gateway.networking.k8s.io`
-- **You do not need to deploy the Cluster Autoscaler.** It is already running, which is what
-  makes the `cluster-api-autoscaler-node-group-*-size` annotations effective.
-
-> **Do not manage these by hand.** They are platform-owned; changes will be reverted and can
-> block upgrades.
+These are platform-owned. Editing them by hand gets reverted and can block upgrades.
 
 ---
 
-## 4. How addons work — the object model
+## 4. How addons are delivered
 
-> **What this covers.** The objects between the two you author and the pods that eventually run —
-> `ClusterAddon`, `AddonConfigDefinition`, and the Carvel `PackageInstall`.
->
-> **Why it matters.** It tells you where to look when an addon does not appear, and it settles the two
-> questions that waste the most time: how addons are actually delivered, and whether apply order
-> matters. It also explains the naming rule that makes configuration silently vanish.
-
-Understanding this model removes most addon troubleshooting guesswork, and it corrects two
-assumptions people commonly bring from other Kubernetes distributions.
-
-### The chain
-
-You author the two objects on the left. The platform creates the rest.
+You author two objects. The platform creates the rest.
 
 ```
-   YOU AUTHOR                        PLATFORM CREATES
-   ─────────────                     ────────────────
-   AddonInstall  ──┐
-   (which addon,   │                 ClusterAddon           PackageInstall (Carvel)
-    which clusters)├──►  addon  ──►  (the join: cluster  ──► in vmware-system-tkg
-   AddonConfig   ──┘   management     × addon × release)      inside the workload cluster
-   (values for one                                                    │
-    cluster)                                                          ▼
-                                                            kapp-controller reconciles
-                                                            the addon's resources
+   YOU AUTHOR                       PLATFORM CREATES
+   AddonInstall  ─┐
+   (which addon,  │                 ClusterAddon          PackageInstall (Carvel)
+    which         ├──►  addon  ──►   (cluster × addon  ──► in vmware-system-tkg,
+    clusters)     │    management     × release)            inside the workload cluster
+   AddonConfig   ─┘                                                 │
+   (values for                                                      ▼
+    one cluster)                                          kapp-controller reconciles
+                                                          the addon's resources
 ```
 
 | Object | Scope | Purpose |
 | --- | --- | --- |
-| `AddonInstall` | vSphere Namespace | *Which* addon, and *which clusters* get it (by label selector). |
-| `AddonConfig` | vSphere Namespace | *How* it is configured on one specific cluster. Optional. |
-| `ClusterAddon` | vSphere Namespace | Platform-created join object: cluster × addon × resolved release, with a `READY` condition. **The best single object for verifying addon state.** |
-| `AddonConfigDefinition` (`acd`) | `vmware-system-vks-public` | The value schema for one addon release. |
-| `PackageInstall` (`pkgi`) | `vmware-system-tkg`, **inside the workload cluster** | The Carvel package that actually deploys the addon's resources. |
+| `AddonInstall` | vSphere Namespace | Which addon, and which clusters get it |
+| `AddonConfig` | vSphere Namespace | How it is configured on one cluster. Optional. |
+| `ClusterAddon` | vSphere Namespace | Platform-created join object, with a `READY` condition |
+| `AddonConfigDefinition` (`acd`) | `vmware-system-vks-public` | The value schema for one addon release |
+| `PackageInstall` (`pkgi`) | `vmware-system-tkg`, in the workload cluster | The Carvel package that deploys the resources |
 
-### How addons are delivered: Carvel packages
+Two properties of this model are worth knowing up front, because both differ from what people expect
+coming from other Kubernetes distributions.
 
-Every addon in this stack is delivered as a **Carvel `PackageInstall`**, reconciled by
-kapp-controller inside the workload cluster. You can see this directly:
+**Addons are Carvel packages, not Helm releases.** kapp-controller reconciles them inside the
+workload cluster, and `pkgi` is where their real status lives:
 
 ```bash
-# in the workload cluster
+# Workload cluster context.
 kubectl get pkgi -A
 ```
 
 ```
-NAMESPACE           NAME                          PACKAGE NAME                          DESCRIPTION
-vmware-system-tkg   <cluster>-cert-manager        cert-manager.kubernetes.vmware.com     Reconcile succeeded
-vmware-system-tkg   <cluster>-headlamp            headlamp.kubernetes.vmware.com         Reconcile succeeded
-vmware-system-tkg   <cluster>-istio               istio.kubernetes.vmware.com            Reconcile succeeded
-vmware-system-tkg   <cluster>-prometheus          prometheus.kubernetes.vmware.com       Reconcile succeeded
-...
+NAMESPACE           NAME                       PACKAGE NAME                          DESCRIPTION
+vmware-system-tkg   <cluster>-cert-manager     cert-manager.kubernetes.vmware.com     Reconcile succeeded
+vmware-system-tkg   <cluster>-istio            istio.kubernetes.vmware.com            Reconcile succeeded
 ```
 
-**This matters because it changes where you look when something is wrong.** `pkgi` and its
-`DESCRIPTION` column (`Reconcile succeeded` / `Reconcile failed`) is the authoritative status for
-addon delivery. Looking for `HelmRelease` objects returns nothing:
+`kubectl get helmrelease -A` returns nothing. That matters mainly for troubleshooting: the
+`DESCRIPTION` column above is the authoritative signal for whether an addon converged.
 
-```bash
-kubectl get helmrelease -A
-# → No resources found
-```
+**Apply order does not matter.** Every addon reconciles independently. Apply the whole manifest in
+one go and let the controllers settle. In particular, helm-controller is not a prerequisite for
+anything else here; it is an independent addon with its own purpose ([6.1](#61-helm-controller)).
 
-### Apply order does not matter
+### The naming rule
 
-**All addons are reconciled independently by the addon management layer. There is no ordering
-requirement and no dependency chain you need to sequence.** Apply the whole manifest in one
-`kubectl apply` and let the controllers converge.
-
-In particular, **`helm-controller` is not a prerequisite for the other addons.** It does not deliver
-them and they do not wait for it. It is an independent addon providing Helm lifecycle management for
-*your own* charts, as a day-2 capability inside the cluster. See [6.1](#61-helm-controller).
-
-The only *practical* sequencing concern is not an ordering requirement at all: the Headlamp
-`hostname` and `callbackURL` must match a DNS name and a registered OIDC redirect URI. If you
-publish the FQDN in advance — which you should — you can apply everything at once. See
-[6.5](#65-headlamp).
-
-### The name convention is a defaulting mechanism
-
-`AddonConfig.spec` has three fields:
+`AddonConfig.spec` has three fields, and two of them have a behaviour worth reading carefully:
 
 ```bash
 kubectl explain addonconfig.spec
 ```
 
-| Field | Behaviour if unset |
+| Field | If unset |
 | --- | --- |
-| `clusterName` | *"If not specified, the AddonConfig will skip the reconciliation."* |
-| `addonConfigDefinitionRef` | *"If not specified, the AddonConfig will skip the reconciliation."* |
+| `clusterName` | "the AddonConfig will skip the reconciliation" |
+| `addonConfigDefinitionRef` | "the AddonConfig will skip the reconciliation" |
 | `values` | Your configuration overlay |
 
-The sample manifest sets **neither** of the first two. Instead it relies on naming the object
-`<clusterName>-<addonName>`, from which the platform derives and then records both fields. You
-can verify that resolution happened:
+The reference profile sets neither. It relies on naming the object `<clusterName>-<addonName>`, from
+which the platform derives both fields and records them. When that name does not resolve, nothing
+errors; the config is simply skipped and the addon runs on schema defaults.
+
+So the check is:
 
 ```bash
-kubectl get addonconfig <CLUSTER_NAME>-istio -n <VSPHERE_NAMESPACE> \
-  -o jsonpath='{.spec.clusterName}{"  "}{.spec.addonConfigDefinitionRef.name}{"\n"}'
-# → workload-vsphere-vks2  istio.kubernetes.vmware.com.1.30.2---vmware.1-vks.1
+kubectl get addonconfig -n <VSPHERE_NAMESPACE> \
+  -o custom-columns='CONFIG:.metadata.name,CLUSTER:.spec.clusterName,DEFINITION:.spec.addonConfigDefinitionRef.name'
 ```
 
-**If those fields come back empty, the config is being skipped** and the addon is running on pure
-schema defaults. This is the precise, checkable form of
-[Pitfall 2](#2-an-addonconfig-that-is-silently-skipped).
+An empty `CLUSTER` or `DEFINITION` means that config is doing nothing.
 
-> **You can also set them explicitly**, which is worth doing in generated or templated manifests
-> where a naming typo would otherwise be silent:
-> ```yaml
-> spec:
->   clusterName: workload-vsphere-vks2
->   addonConfigDefinitionRef:
->     name: istio.kubernetes.vmware.com.1.30.2---vmware.1-vks.1
->     namespace: vmware-system-vks-public
->   values: {...}
-> ```
-> Naming the `acd` explicitly also **pins the addon release**, rather than accepting whatever the
-> platform resolves.
+In generated or templated manifests, set both explicitly instead. It removes the failure mode, and
+naming the `acd` also pins the addon release:
 
-### Verifying the whole stack in one command
+```yaml
+spec:
+  clusterName: workload-vsphere-vks2
+  addonConfigDefinitionRef:
+    name: istio.kubernetes.vmware.com.1.30.2---vmware.1-vks.1
+    namespace: vmware-system-vks-public
+  values: {...}
+```
+
+The one command that shows the whole stack at once:
 
 ```bash
 kubectl get clusteraddon -n <VSPHERE_NAMESPACE>
 ```
 
 ```
-NAME                     CLUSTER                 ADDON                ADDONINSTALL        RELEASE                    READY
-<cluster>-cert-manager   workload-vsphere-vks2   cert-manager         cluster-cert-manager cert-manager...1.20.3      True
-<cluster>-istio          workload-vsphere-vks2   istio                cluster-istio        istio...1.30.2             True
-<cluster>-prometheus     workload-vsphere-vks2   prometheus           cluster-prom         prometheus...3.5.4         True
+NAME                     CLUSTER                 ADDON          ADDONINSTALL           RELEASE                 READY
+<cluster>-cert-manager   workload-vsphere-vks2   cert-manager   cluster-cert-manager   cert-manager...1.20.3   True
+<cluster>-prometheus     workload-vsphere-vks2   prometheus     cluster-prom           prometheus...3.5.4      True
 ```
 
-This is the single most useful addon command: it shows the resolved release, the owning
-`AddonInstall`, and readiness in one view. Note the `prometheus` row — the `AddonInstall` is named
-`cluster-prom` while the addon is `prometheus`. **The `ADDON` column, not the `AddonInstall`
-name, is what the `AddonConfig` name must match.**
+Note the last row. The `AddonInstall` is called `cluster-prom` while the addon is `prometheus`. It is
+the `ADDON` column that the `AddonConfig` name has to match.
 
 ---
 
-## 5. Discovering addons and their value schemas
+## 5. Reading an addon's value schema
 
-> **What this covers.** Two equivalent ways to read an addon release's value schema — the `vcf` CLI
-> and `kubectl`.
->
-> **Why it matters.** `AddonConfig` is a sparse overlay: you set a few fields and inherit everything
-> else. You cannot reason about your configuration without knowing what those inherited defaults are,
-> and they move between addon releases — which is why this document quotes commands rather than
-> default values.
-
-You now know that an `AddonConfig` is validated against an `AddonConfigDefinition`
-([section 4](#4-how-addons-work--the-object-model)). This section is how you read that definition —
-because before writing any `AddonConfig`, you need to know what fields exist and what they default
-to. There are two ways, and they return the same schemas.
-
-### With the `vcf` CLI
+An `AddonConfig` is a sparse overlay. You set a few fields and inherit the rest, so you cannot reason
+about your configuration without knowing what you are inheriting. Two equivalent ways to look:
 
 ```bash
-vcf addon available list                                    # every addon in your environment
-vcf addon available-releases list --addon-name istio         # releases of one addon
-vcf addon available-releases get <release> -o output.yaml    # the full commented value schema
-```
+# with the vcf CLI
+vcf addon available list
+vcf addon available-releases list --addon-name istio
+vcf addon available-releases get <release> -o output.yaml
 
-### With `kubectl`, against the Supervisor
-
-Each addon release is represented by an `AddonConfigDefinition` (short name `acd`), which
-carries the OpenAPI schema the addon management layer validates your `AddonConfig` against:
-
-```bash
-# every addon release available, as objects
+# with kubectl, against the Supervisor
 kubectl get acd -n vmware-system-vks-public
-
-# just the releases of one addon
 kubectl get acd -n vmware-system-vks-public | grep '^istio'
-
-# the schema itself
 kubectl get acd <release-name> -n vmware-system-vks-public -o yaml
 ```
 
-**Step 3 / the schema dump is the step that gets skipped, and it is the important one.**
+The third command in either column is the one that gets skipped, and it is the one that matters. It
+emits the full commented schema, with that release's defaults.
 
-- **`AddonConfig` is a sparse overlay, not a complete specification.** You set only what you
-  want to change; everything else comes from the schema defaults. You cannot reason about your
-  configuration without knowing those defaults.
-- **Field names and nesting are not guessable.** These schemas resemble the upstream Helm chart
-  values they derive from but are not identical, and a field at the wrong nesting level is
-  rejected or ignored rather than silently working.
-- **Defaults move between addon releases.** Any default written into a document — including this
-  one — is a snapshot. The command is not. **This document therefore does not assert specific
-  addon default values**; where a value looks like a deliberate deviation, it says so and points
-  you here.
+Three reasons to run it rather than trust a document:
 
-> **Pin what you deploy.** These commands return specific, versioned releases. Record the exact
-> release you validated against and promote new ones deliberately — see
-> [Day-2](#12-day-2-lifecycle).
+- Field names are not guessable. These schemas resemble the upstream Helm chart values they derive
+  from without matching them, and a field at the wrong nesting level is rejected or ignored.
+- Defaults move between addon releases. Any default written into a guide is a snapshot.
+- You need the defaults to know what your overlay is actually changing.
+
+For that reason this guide does not state specific addon default values. Where a value in the
+reference profile is a deliberate departure from the default, it says so and points you here.
+
+Record the exact release you validated, and promote new ones deliberately. Naming the `acd` in
+`spec.addonConfigDefinitionRef` is how you pin it.
 
 ---
 
-## 6. The addons, annotated
+## 6. The addon stack
 
-> **What this covers.** Every field of the five addons in the reference profile: what it does, why it
-> is set that way, and where it will bite you.
->
-> **Why it matters.** Each of these addons has at least one value whose effect is not deducible from
-> its name — a monitoring stack that collects nothing, an ingress controller that is not a mesh, a UI
-> that needs three systems to agree before anyone can log in.
+Five addons: package lifecycle, certificates, monitoring, ingress, and a UI. It is a reasonable
+baseline, and each one has at least one setting whose effect you would not guess from its name.
 
-The five addons in this stack are a sensible baseline: package lifecycle, certificates,
-monitoring, ingress, and a UI. [6.6](#66-additional-addons-worth-considering) covers the rest of
-the catalogue.
-
-Every `AddonInstall` in the manifest follows the same shape, so it is explained once here and not
-repeated per addon:
+Every `AddonInstall` in the profile has the same shape, so here it is once:
 
 ```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1   # ← VKS addon framework API group (alpha)
-kind: AddonInstall                                  # ← "install this addon on these clusters"
+apiVersion: addons.kubernetes.vmware.com/v1alpha1   # alpha API; expect field changes across releases
+kind: AddonInstall
 metadata:
-  name: cluster-istio                               # ← arbitrary; names the intent, not the addon
-  namespace: <VSPHERE_NAMESPACE>                    # ← vSphere Namespace, NOT a guest namespace
+  name: cluster-istio                               # arbitrary; names the intent, not the addon
+  namespace: <VSPHERE_NAMESPACE>
 spec:
   addonRef:
-    name: istio                                     # ← must match `vcf addon available list`
+    name: istio                                     # must match `vcf addon available list`
   clusters:
-  - selector:                                       # ← a LIST — multiple selectors allowed
+  - selector:                                       # a list, so multiple selectors are allowed
       matchLabels:
         cluster.x-k8s.io/cluster-name: <CLUSTER_NAME>
 ```
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `apiVersion` | `v1alpha1` — an alpha API. Expect field changes across VKS releases. | No compatibility guarantee. Keep manifests in version control so you can diff after an upgrade. |
-| `metadata.name` | Free-form. `cluster-<addon>` reads as "this addon, at cluster scope". | Must be unique in the namespace. If you manage several clusters from one vSphere Namespace, `cluster-istio` collides — prefix with the cluster name. **This name is *not* what the `AddonConfig` matches** — `spec.addonRef.name` is. |
-| `spec.addonRef.name` | Selects the addon. | No version field here; the platform resolves a release. To pin, name the `acd` explicitly in the `AddonConfig` ([section 4](#the-name-convention-is-a-defaulting-mechanism)). |
-| `spec.clusters[].selector` | `cluster.x-k8s.io/cluster-name` is applied to every `Cluster` automatically by Cluster API, so it always works with no extra labelling. | **Selector breadth is a policy decision.** Matching on cluster name targets one cluster; a broader selector (`environment: dev`) is a fleet-rollout tool — and a foot-gun if you thought you were configuring one cluster. |
+Cluster API applies the `cluster.x-k8s.io/cluster-name` label automatically, so selecting on it always
+works with no extra labelling. Selector breadth is a policy choice: matching on cluster name targets
+one cluster, while a broader selector such as `environment: dev` becomes a fleet rollout mechanism.
+Useful, as long as you meant it.
 
-Likewise, every `AddonConfig` carries this annotation:
+If you manage several clusters from one vSphere Namespace, note that `metadata.name` must be unique
+there, so `cluster-istio` will collide. Prefix with the cluster name.
+
+Every `AddonConfig` carries this annotation, and should:
 
 ```yaml
   annotations:
     clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
 ```
 
-**Set this on every `AddonConfig`.** It ties the config's lifecycle to the addon and cluster so it
-is garbage-collected on teardown. Without it you leave orphans behind — and because binding is
-name-derived, an orphan can be silently adopted by a future cluster that reuses the name,
-inheriting configuration nobody remembers writing.
-
----
+It ties the config's lifetime to the addon and cluster so it is cleaned up on teardown. Without it
+you accumulate orphans, and since binding is name-derived, an orphan gets adopted by the next cluster
+that reuses the name.
 
 ### 6.1 helm-controller
 
+Declarative Helm chart lifecycle management inside the workload cluster. You create `HelmRelease`
+objects; helm-controller and its companion source-controller reconcile them, handling upgrades,
+rollbacks, and drift.
+
+This is a day-2 capability for your own charts. It does not deliver the other addons and they do not
+wait for it, so install it because you want GitOps-style Helm management, not because the stack needs
+it. If you are not managing charts declaratively in this cluster, it is optional.
+
 ```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonInstall
-metadata:
-  name: cluster-helm-controller
-  namespace: <VSPHERE_NAMESPACE>
-spec:
-  addonRef:
-    name: helm-controller
-  clusters:
-  - selector:
-      matchLabels:
-        cluster.x-k8s.io/cluster-name: <CLUSTER_NAME>
----
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonConfig
-metadata:
-  annotations:
-    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
-  name: <CLUSTER_NAME>-helm-controller
-  namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
     helmController:
@@ -790,549 +500,391 @@ spec:
       priorityClassName: ""
 ```
 
-> **What this addon is for.** helm-controller (with its companion source-controller) provides
-> **declarative Helm chart lifecycle management inside the workload cluster** — a day-2 capability
-> for *your own* application charts. You create `HelmRelease` objects; it reconciles them,
-> handling upgrades, rollbacks, and drift.
->
-> **What it is not.** It does not deliver the other addons in this stack and they do not depend on
-> it. Those are Carvel packages reconciled by kapp-controller ([section 4](#how-addons-are-delivered-carvel-packages)).
-> Install it because you want GitOps-style Helm management, not because something else needs it.
+Empty string means no PriorityClass, so both controllers run at default priority and are as evictable
+as a batch job under node pressure. If production workloads arrive through Helm releases, the
+controller that keeps them in sync being evicted means drift goes uncorrected. `system-cluster-critical`
+is the better choice.
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| Two controllers | `helmController` reconciles releases; `sourceController` fetches chart artifacts. Both are needed. | If your `HelmRelease` objects stall, check both pods — they run in `vmware-system-helm` in the workload cluster. |
-| `priorityClassName: ""` | Empty means **no PriorityClass**, so these pods run at default (zero) priority. | Under node pressure they are as evictable as a batch job. If you are running production workloads through Helm releases, the controller that reconciles them being evicted means drift goes uncorrected. Consider `system-cluster-critical`. |
-| Only two fields set | A good illustration that `AddonConfig` is a **sparse overlay** — every other helm-controller setting is at its schema default. | See [section 5](#5-discovering-addons-and-their-value-schemas). |
-
-**Do you need it?** If you are not managing Helm charts declaratively in this cluster, this addon
-is optional. It is in the recommended set because most teams eventually want it, not because the
-stack requires it.
-
----
+This config also demonstrates the overlay model: it sets two fields, and every other
+helm-controller setting comes from the schema.
 
 ### 6.2 cert-manager
 
-```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonInstall
-metadata:
-  name: cluster-cert-manager
-  namespace: <VSPHERE_NAMESPACE>
-spec:
-  addonRef:
-    name: cert-manager
-  clusters:
-  - selector:
-      matchLabels:
-        cluster.x-k8s.io/cluster-name: <CLUSTER_NAME>
+Certificate issuance and rotation, driven by `Issuer` and `ClusterIssuer` resources.
+
+It has no `AddonConfig` in the profile. That is legal and sensible; an addon with no config takes
+schema defaults, which for cert-manager is what you want. Do not read the other four as implying a
+config is mandatory.
+
+cert-manager is a required component here rather than an optional extra. The Headlamp addon creates its own
+`Issuer` and `Certificate` and terminates TLS on its Gateway with the result, so the UI depends on it:
+
+```bash
+# Workload cluster context.
+kubectl get certificate,issuer -n headlamp
 ```
 
-**No `AddonConfig`, deliberately.** An addon with no config takes every schema default, which for
-cert-manager is the right choice. Do not infer from the other addons that a config is required.
-
-| Consideration | Detail |
-| --- | --- |
-| **Why it is a real dependency here** | The Headlamp addon uses it. On deployment, Headlamp creates its own cert-manager `Issuer` and `Certificate` and terminates TLS on its Gateway with the resulting secret — so cert-manager is load-bearing for the UI, not decoration. See [6.5](#65-headlamp). |
-| What it does more generally | Issues and rotates certificates for admission webhooks, ingress/gateway TLS, and internal service TLS, driven by `Issuer`/`ClusterIssuer` resources. |
-| Ordering | None required. If Headlamp reconciles first, its `Certificate` simply stays pending until cert-manager is ready, then resolves. |
-| **Production consideration** | The issuer Headlamp creates is **self-signed**, so browsers will warn. For production, add a `ClusterIssuer` backed by a **trusted CA** — your enterprise PKI or ACME — and point the Gateway at a certificate from it. See [Appendix B](#appendix-b--additional-objects-and-hardening). |
-
----
+The issuer Headlamp creates is self-signed, which is fine in a lab and produces browser warnings
+everywhere else. [Appendix B.2](#b2-a-trusted-certificate-for-the-ui) covers replacing it.
 
 ### 6.3 Prometheus
 
+The profile enables the exporters and the operator, and deliberately leaves out the packaged
+Prometheus server:
+
 ```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonInstall
-metadata:
-  name: cluster-prom                    # ← install name is arbitrary; the ADDON is "prometheus"
-  namespace: <VSPHERE_NAMESPACE>
-spec:
-  addonRef:
-    name: prometheus
-  clusters:
-  - selector:
-      matchLabels:
-        cluster.x-k8s.io/cluster-name: <CLUSTER_NAME>
----
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonConfig
-metadata:
-  annotations:
-    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
-  name: <CLUSTER_NAME>-prometheus        # ← "prometheus", NOT "prom" — matches the addon name
-  namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
-    deploycomponents:                    # ← lowercase, hyphenated keys — match exactly
-      kube-state-metrics: true           # ← Kubernetes object-state metrics
-      node-exporter: true                # ← per-node OS/hardware metrics
-      pushgateway: false                 # ← correctly disabled
-      prometheus: false                  # ← intentional: you deploy the server via the operator
-      alertmanager: true                 # ← alert routing and delivery
-      prometheus-operator: true          # ← the CRDs + operator you will drive
+    deploycomponents:
+      kube-state-metrics: true       # Kubernetes object state
+      node-exporter: true            # per-node OS and hardware metrics
+      pushgateway: false
+      prometheus: false              # operator-managed instead; see below
+      alertmanager: true
+      prometheus-operator: true
 ```
 
-> **The intended pattern: operator-managed Prometheus.** `prometheus: false` with
-> `prometheus-operator: true` is deliberate. Rather than accepting the packaged Prometheus server
-> and its baked-in settings, you enable the **operator** and then declare your own `Prometheus`
-> custom resource — giving you direct control over replica count, retention, persistent storage,
-> scrape configuration, and external labels, all as version-controlled Kubernetes objects.
->
-> This is the right choice for anyone who cares about their monitoring configuration. It has one
-> requirement: **you must actually create the `Prometheus` CR.** Until you do, the operator and
-> CRDs are installed, the exporters are producing metrics, and nothing is scraping or evaluating
-> them. Confirm with:
->
-> ```bash
-> kubectl get prometheus,alertmanager,servicemonitor -A
-> # "No resources found" means the operator is idle — see Appendix B.3
-> ```
+This is the operator-managed pattern. Instead of accepting a packaged server with its baked-in
+settings, you enable the operator and declare your own `Prometheus` custom resource, which gives you
+control over replicas, retention, persistent storage, scrape configuration, and external labels as
+version-controlled objects. For anyone who cares about their monitoring configuration it is the right
+choice.
 
-**This is the manifest's most important follow-up action.** The `Prometheus` CR is in
-[Appendix B.3](#b3-a-prometheus-instance-via-the-operator).
+It has one requirement that is easy to miss. Until you create that CR, the operator and CRDs are
+installed, the exporters are producing metrics, and nothing is scraping or evaluating them:
 
-| Component | Value | Role | Guidance |
-| --- | --- | --- | --- |
-| `kube-state-metrics` | `true` | Exports the state of Kubernetes objects — deployment replica counts, pod phases, PVC status. | Keep enabled. There is no substitute for cluster-state signals. |
-| `node-exporter` | `true` | Per-node OS and hardware metrics: CPU, memory, disk, filesystem fill. | Keep enabled. Runs as a DaemonSet, so it needs elevated host access — relevant to your Pod Security choice, and a good candidate for a **namespace exemption** rather than a cluster-wide relaxation ([7.7.3](#773-securitypodsecuritystandard)). |
-| `pushgateway` | `false` | Accepts pushed metrics from short-lived batch jobs. | Correctly disabled. Pushgateway retains metrics indefinitely, becoming a source of stale data. Enable only for genuine batch use cases. |
-| `prometheus` | `false` | The packaged Prometheus server. | Disabled on purpose — see the callout above. |
-| `alertmanager` | `true` | Routes, groups, deduplicates, and delivers alerts. | Needs two things to be useful: a rule evaluator (your `Prometheus` CR) and **configured receivers**. An Alertmanager with no receivers delivers nowhere. |
-| `prometheus-operator` | `true` | Installs the CRDs (`Prometheus`, `ServiceMonitor`, `PodMonitor`, `PrometheusRule`, `Alertmanager`) and the reconciling operator. | The foundation of this pattern. Also lets application teams declare their own scrape targets declaratively. |
+```bash
+# Workload cluster context.
+kubectl get prometheus,alertmanager,servicemonitor -A
+# "No resources found" means the operator is idle
+```
 
-**Watch the key spelling.** `deploycomponents` is lowercase and the component keys are hyphenated
-(`kube-state-metrics`, not `kubeStateMetrics`). Keys are matched literally; a "corrected" camelCase
-key is not applied. Verify against the schema output.
+[Appendix B.3](#b3-a-prometheus-instance) has the CR. This is the most important follow-up action in
+the whole profile.
 
-**Note the naming.** The `AddonInstall` is `cluster-prom`, but the addon is `prometheus`, so the
-`AddonConfig` must be `<CLUSTER_NAME>-prometheus`. Naming it `-prom` would match nothing.
+On the individual components: `kube-state-metrics` and `node-exporter` are the minimum for cluster and
+node visibility, and node-exporter runs as a DaemonSet needing host access, which makes it a good
+candidate for a Pod Security namespace exemption ([7.6](#76-pod-security)) rather than a cluster-wide
+relaxation. `pushgateway: false` is correct; Pushgateway retains metrics indefinitely and becomes a
+source of stale data outside genuine batch use cases. Alertmanager needs both a rule evaluator and
+configured receivers, or it delivers nowhere.
 
----
+Two spelling traps. The key is lowercase `deploycomponents`, and the component names are hyphenated.
+Keys are matched literally, so a tidied-up camelCase key is not applied. And the `AddonInstall` here
+is named `cluster-prom` while the addon is `prometheus`, so the config must be
+`<cluster>-prometheus`. Calling it `-prom` matches nothing.
 
-### 6.4 Istio — deployed for L4/L7, not as a service mesh
+### 6.4 Istio
 
-> **Scope matters here, so start with it.** In this stack Istio is deployed for one purpose:
-> **L4 and L7 traffic management** — the ingress gateway and the Gateway API controller that
-> exposes services outside the cluster, including the Headlamp UI. It is **not** being used as a
-> service mesh. No sidecars are injected, no mTLS is established between workloads, and no
-> east-west traffic policy is applied.
->
-> That is a legitimate and increasingly common way to run Istio, and it keeps the footprint small.
-> But it changes which settings matter and which are inert, so it is worth stating explicitly
-> rather than leaving readers to infer a mesh they are not getting.
->
-> Verify the scope on any cluster with:
-> ```bash
-> kubectl get ns -L istio-injection,istio.io/dataplane-mode
-> # every namespace blank in both columns → gateway-only, no mesh dataplane
-> ```
+Istio is in this stack for one job: L4 and L7 traffic management. It provides the ingress gateway and
+the Gateway API controller that exposes services outside the cluster, including the Headlamp UI.
+
+It is not being used as a service mesh. No sidecars are injected, no workload mTLS is established, no
+east-west policy applies. That is a legitimate and increasingly common way to run Istio, and it keeps
+the footprint small, but it changes which settings matter. You can confirm the scope on any cluster:
+
+```bash
+# Workload cluster context.
+kubectl get ns -L istio-injection,istio.io/dataplane-mode
+# every namespace blank in both columns means gateway-only
+```
 
 ```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonConfig
-metadata:
-  annotations:
-    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
-  name: <CLUSTER_NAME>-istio
-  namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
     istio:
-      namespace: "istio-system"        # ← GUEST cluster namespace; addon creates and owns it
+      namespace: "istio-system"        # guest namespace; the addon creates and owns it
       ambientMode:
-        enabled: false                 # ← no ambient dataplane (not needed for gateway-only)
+        enabled: false
       istioCNI:
-        enabled: false                 # ← not needed without sidecar injection; see below
+        enabled: false                 # see the note below
       gateways:
         ingress:
-          enabled: true                # ← THE point of this addon: the L4/L7 entry point
-          namespace: istio-ingress     # ← separate from istio-system: good practice
+          enabled: true                # the reason this addon is here
+          namespace: istio-ingress
           autoscaling:
             enabled: true
-            minReplicas: 1             # ← single ingress pod = outage on reschedule
+            minReplicas: 1
             maxReplicas: 5
       pilot:
-        replicas: 1                    # ← conflicts with the HPA below
+        replicas: 1
         autoscaling:
           enabled: true
-          minReplicas: 1               # ← istiod is the Gateway controller: SPOF
+          minReplicas: 1
           maxReplicas: 2
       meshConfig:
-        accessLogFile: ""              # ← gateway access logging DISABLED
+        accessLogFile: ""
         enableTracing: false
-        meshID: "<CLUSTER_NAME>"
+        meshID: "workload-vsphere-vks2"
 ```
 
-#### A note on `istioCNI` and Pod Security
+| Setting | Comment |
+| --- | --- |
+| `gateways.ingress.namespace: istio-ingress` | Putting the gateway in its own namespace, separate from the control plane, limits blast radius and lets you grant teams access to gateway resources without control-plane access. Worth copying. Note that a Gateway API `Gateway` created with `create: true` provisions its own LoadBalancer in its own namespace and does not share this one. |
+| Ingress `minReplicas: 1` | A single ingress pod means all inbound traffic fails during any reschedule: node drain, upgrade, eviction. Use 2, with a PodDisruptionBudget and anti-affinity across nodes. |
+| `pilot.replicas: 1` alongside an HPA | When an HPA owns a Deployment it owns `spec.replicas`, so the static value is not authoritative and causes reconcile churn. Drop it and express intent through `minReplicas`. |
+| `pilot.autoscaling.minReplicas: 1` | istiod is the Gateway API controller. While it is down, existing gateways keep forwarding on last-known config but no `Gateway` or `HTTPRoute` change takes effect, including istiod's own upgrade. Use 2. |
+| `meshConfig.accessLogFile: ""` | Empty disables Envoy access logs. At this scope those are your ingress request logs: what arrived, which route matched, what status came back. That is the tool you reach for when an `HTTPRoute` 404s or an OIDC redirect fails. Enable `/dev/stdout` during bring-up and while validating auth, then decide based on volume. |
+| `meshConfig.enableTracing: false` | Of limited value without a mesh; you would see gateway spans only. Setting it true also needs a tracing provider configured. |
+| `meshConfig.meshID` | Harmless and tidy in telemetry, largely inert at this scope. It matters if you later federate clusters into one mesh, which needs a shared `meshID` with distinct `network` values. If that is on your roadmap, name the mesh rather than the cluster. |
 
-There is a widely cited coupling between Istio and Pod Security Standards, and it is worth being
-precise about it because **it does not apply to this deployment.**
+#### On Istio CNI and Pod Security
 
-The coupling is real **only when sidecar injection is enabled**. In that case, if Istio CNI is
-off, traffic redirection is performed by an init container in every injected pod, and that init
-container needs `NET_ADMIN`/`NET_RAW` — capabilities that the `baseline` and `restricted` Pod
-Security Standards both forbid. Enabling `istioCNI` moves that work to a per-node DaemonSet so
-workload pods need no elevated capabilities.
+There is a widely repeated claim that Istio forces you into `privileged` Pod Security. It is true, but
+only under a condition this deployment does not meet, so it is worth being precise.
 
-**This cluster injects no sidecars**, so no workload pod requires those capabilities and
-`istioCNI.enabled: false` imposes no constraint on your Pod Security Standard. The
-`podSecurityStandard: privileged` setting elsewhere in the manifest is a **dev/test reference
-choice**, not a consequence of this Istio configuration — see
-[7.7.3](#773-securitypodsecuritystandard).
+With sidecar injection enabled and Istio CNI off, traffic redirection is done by an init container in
+every injected pod, and that container needs `NET_ADMIN` and `NET_RAW`. Both the `baseline` and
+`restricted` standards forbid those capabilities. Enabling `istioCNI` moves the work to a per-node
+DaemonSet, so workload pods need nothing elevated.
+
+This cluster injects no sidecars, so no workload pod requires those capabilities and
+`istioCNI.enabled: false` places no constraint on your Pod Security choice. The `privileged` setting
+in [7.6](#76-pod-security) is a lab decision, not a consequence of this Istio configuration.
 
 | Your Istio scope | `istioCNI` | Pod Security impact |
 | --- | --- | --- |
-| **Gateway/ingress only** (this stack) | `false` is fine | **None.** Choose your PSS level freely. |
-| Sidecar mesh | `false` | Injected pods need `NET_ADMIN`/`NET_RAW` → `privileged` required |
-| Sidecar mesh | `true` | No elevated capabilities in workload pods → `baseline`/`restricted` viable |
-| Ambient mesh | n/a | Per-node ztunnel; no per-pod privilege |
+| Gateway and ingress only | `false` is fine | None |
+| Sidecar mesh | `false` | Injected pods need `NET_ADMIN`, so `privileged` |
+| Sidecar mesh | `true` | Nothing elevated in workload pods |
+| Ambient mesh | n/a | Per-node ztunnel, no per-pod privilege |
 
-**If you later adopt the mesh**, enable `istioCNI` at the same time. Retrofitting it after
-labelling namespaces for injection means every injected workload needs `privileged` in the interim.
+If you adopt the mesh later, enable `istioCNI` in the same change. Retrofitting it after labelling
+namespaces for injection means every injected workload needs `privileged` in the meantime.
 
-#### Istio field reference
-
-| Field | Value | Why | Pitfall |
-| --- | --- | --- | --- |
-| `istio.namespace` | `istio-system` | Control-plane namespace **inside the workload cluster**. Conventional and expected by tooling. | The addon creates and owns it. Pre-creating it by hand, or managing it with another tool, causes ownership conflicts. |
-| `ambientMode.enabled` | `false` | Ambient's per-node ztunnel dataplane is a mesh feature. With no mesh, there is nothing for it to do. | Correct for this scope. If you adopt ambient later, treat it as a migration — it changes how every packet is handled — not a toggle. |
-| `istioCNI.enabled` | `false` | Only needed for sidecar injection. | See the note above. Inert at this scope. |
-| `gateways.ingress.enabled` | `true` | **The reason this addon is here.** Deploys the ingress gateway and its LoadBalancer Service — the cluster's north-south entry point, and the Istio Gateway API controller that programs `Gateway` resources. | The LoadBalancer needs an available VIP. If `EXTERNAL-IP` stays `<pending>`, the problem is your load-balancer provider or IP pool, not Istio. |
-| `gateways.ingress.namespace` | `istio-ingress` | **Good practice.** Separating the data-plane gateway from the control plane limits blast radius and lets you grant teams access to gateway resources without control-plane access. | Note that a Gateway API `Gateway` with `create: true` provisions its **own** LoadBalancer in its **own** namespace — it does not share this one. See [6.5](#65-headlamp). |
-| `gateways.ingress.autoscaling` | `1`–`5` | Scales ingress capacity with traffic. | **`minReplicas: 1` is a production risk.** During any reschedule — node drain, upgrade, eviction — you have zero ingress pods and all inbound traffic fails. Use `2` minimum, with a `PodDisruptionBudget` and anti-affinity across nodes. |
-| `pilot.replicas` | `1` | Static replica count for istiod. | **Conflicts with the HPA immediately below it.** When an HPA owns a Deployment it owns `spec.replicas`; a static value is not authoritative and invites reconcile churn. Express intent through `minReplicas` and drop this field. |
-| `pilot.autoscaling` | `1`–`2` | istiod is the Gateway API controller and configures the gateway proxies. | **A single istiod is a single point of failure for all ingress configuration.** Existing gateways keep forwarding on last-known config, so it is not an instant outage — but no `Gateway` or `HTTPRoute` change takes effect while it is down, and that includes its own upgrade. Use `minReplicas: 2`. |
-| `meshConfig.accessLogFile` | `""` | Empty **disables** Envoy access logs. Saves CPU and log volume. | **At gateway-only scope these are your ingress access logs** — the per-request record of what arrived, which route matched, and what status was returned. That is the primary tool for debugging a 404 from a misconfigured `HTTPRoute` or a failing OIDC redirect. Enable it (`/dev/stdout`) during bring-up and while validating any auth path. |
-| `meshConfig.enableTracing` | `false` | Distributed tracing off. | Of limited value without a mesh — you would only see gateway spans. Setting `true` also requires configuring a tracing provider, not just this flag. |
-| `meshConfig.meshID` | `<CLUSTER_NAME>` | Identifies the mesh; harmless and tidy in telemetry. | Largely inert at gateway-only scope. It matters if you later federate multiple clusters into one mesh — that requires a **shared** `meshID` with distinct `network` values, so a cluster-derived value would need changing. If mesh federation is on your roadmap, name the mesh (`prod-mesh`) rather than the cluster. |
-
-> **Alternative: Contour.** If all you need is HTTP ingress and you are not planning to adopt a
-> mesh, the **`contour`** addon is a lighter-weight ingress controller with a smaller footprint
-> and less operational surface. Istio makes sense if you want Gateway API with a path to a mesh,
-> richer L4/L7 policy, or mTLS later. Contour makes sense if you want ingress and nothing more.
-
----
+If all you need is HTTP ingress and a mesh is not on the roadmap, the `contour` addon is lighter and
+has less operational surface. Istio makes sense when you want Gateway API with a path to a mesh, or
+richer L4/L7 policy later.
 
 ### 6.5 Headlamp
 
-A web UI for the cluster, exposed through a Gateway API `Gateway` and authenticated with OIDC.
+A web UI for the cluster, served through a Gateway API `Gateway` and authenticated with OIDC. It is
+the most cross-coupled object in the profile and the source of most "it deployed but does not work"
+reports.
 
 ```yaml
-apiVersion: addons.kubernetes.vmware.com/v1alpha1
-kind: AddonConfig
-metadata:
-  annotations:
-    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
-  name: <CLUSTER_NAME>-headlamp
-  namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
-    hostname: headlamp.k8s.example.com     # ← a real FQDN; must resolve to the Gateway's IP
+    hostname: headlamp.k8s.example.com
     gatewayApi:
-      enabled: true                        # ← route via Gateway API
+      enabled: true
       gateway:
-        className: istio                   # ← REQUIRES a gateway controller: Istio or Contour
-        create: true                       # ← the addon owns this Gateway (and its LoadBalancer)
+        className: istio                 # requires a gateway controller
+        create: true                     # the addon owns this Gateway and its LoadBalancer
         name: headlamp-gateway
     oidc:
       enabled: true
-      issuerURL: https://idp.example.com   # ← must match the token's `iss` claim exactly
-      # This client ID must also appear in the API server's extraAuthentication
-      # audiences list, or tokens issued here are rejected by the cluster.
+      issuerURL: https://idp.example.com
       clientID: <OIDC_CLIENT_ID>
-      clientSecret: <OIDC_CLIENT_SECRET>   # ← plaintext in etcd and in Git
+      clientSecret: <OIDC_CLIENT_SECRET>
       callbackURL: https://headlamp.k8s.example.com/oidc-callback
       scopes:
-      - openid                             # ← mandatory for OIDC
-      - email                              # ← load-bearing: feeds the username claim
-      - profile                            # ← convenience only
+      - openid
+      - email
+      - profile
 ```
 
-> **The one hard prerequisite: a gateway controller.**
->
-> `gatewayApi.gateway.className` must name a controller that exists in the cluster. That means
-> **you must install either the `istio` addon (with `gateways.ingress.enabled: true`) or the
-> `contour` addon** before Headlamp can be reached. Without a matching controller the `Gateway`
-> object is created and stays unprogrammed forever — Headlamp runs, but nothing routes to it.
->
-> This is not an ordering requirement (the addons reconcile independently and it will resolve
-> itself once the controller appears) — it is a **completeness** requirement. Confirm with:
-> ```bash
-> kubectl get gateway -A
-> # PROGRAMMED must be True and ADDRESS must be populated
-> ```
->
-> The Gateway API CRDs themselves are installed by the platform — you do not add them
-> ([section 3](#3-what-vks-installs-for-you)).
-
-#### The hostname, DNS, and the OIDC redirect must agree
-
-This is the part that most often costs an afternoon, because the three values live in three
-different systems and a mismatch surfaces as an error from your identity provider rather than from
-Kubernetes.
-
-With `gateway.create: true`, the addon provisions its **own** `Gateway` and a dedicated
-LoadBalancer Service in the Headlamp namespace — separate from the Istio ingress gateway, with its
-**own external IP**:
+It has one hard prerequisite. `gatewayApi.gateway.className` must name a controller that exists, which
+means installing either the `istio` addon with `gateways.ingress.enabled: true`, or `contour`. Without
+one the `Gateway` object is created and stays unprogrammed forever: Headlamp runs, nothing routes to
+it. This is a completeness requirement rather than an ordering one, since it resolves itself once the
+controller appears.
 
 ```bash
+# Workload cluster context.
 kubectl get gateway -A
-# NAME               CLASS   ADDRESS          PROGRAMMED
-# headlamp-gateway   istio   10.x.x.x         True        ← this is the IP DNS must point to
-
-kubectl get svc -n headlamp
-# headlamp-gateway-istio   LoadBalancer   ...   10.x.x.x   443:31596/TCP
+# PROGRAMMED must be True with an ADDRESS
 ```
 
-**Use a real FQDN you publish in DNS.** This document uses `headlamp.k8s.example.com` throughout,
-and there are three things to line up.
+The Gateway API CRDs themselves come with the platform ([section 3](#3-what-the-platform-already-gives-you)),
+so their presence tells you nothing about whether a controller exists.
 
-> **A note if your starting manifest uses a wildcard-DNS shortcut.** Lab manifests sometimes set the
-> hostname to an IP-derived name — the `<ip>.sslip.io` and `<ip>.nip.io` services resolve
-> `anything.<ip>.sslip.io` to that IP, which is genuinely handy when you control no DNS. Replace it
-> before production: it hardwires the LoadBalancer IP into the hostname, the `callbackURL`, and your
-> IdP's redirect-URI registration simultaneously, and it makes name resolution for your management UI
-> depend on a third-party service.
+#### Hostname, DNS, and the redirect URI
 
-**The three-step setup:**
+This is the most common source of lost time, because the three values live in three different systems
+and a mismatch surfaces as an error page from your identity provider rather than anything in
+Kubernetes.
 
-| Step | Action |
+With `create: true` the addon provisions its own `Gateway` and a dedicated LoadBalancer in the Headlamp
+namespace, with its own external IP. That address, not the Istio ingress gateway's, is what DNS must
+point at:
+
+```bash
+# Workload cluster context.
+kubectl get gateway -A          # ADDRESS column
+kubectl get svc -n headlamp     # headlamp-gateway-<class>, EXTERNAL-IP
+```
+
+Three steps, in any order:
+
+1. Choose the FQDN and use it for both `hostname` and the host in `callbackURL`.
+2. Publish a DNS A record for it, pointing at the Gateway's address. Reserve that IP with your
+   load-balancer provider so the value is stable.
+3. Register `https://<FQDN>/oidc-callback` as an authorized redirect URI at your identity provider.
+   Most providers reject anything unregistered outright.
+
+Do all three up front and nothing depends on discovering an IP after the fact, so the whole manifest
+can go in at once.
+
+If your starting manifest uses an IP-derived hostname, replace it. Services like `<ip>.sslip.io`
+resolve `anything.<ip>.sslip.io` to that address and are handy when you control no DNS, but they wire
+the LoadBalancer IP into the hostname, the callback URL, and your provider's redirect registration all
+at once, and they make name resolution for your management UI depend on a third party.
+
+| Field | Comment |
 | --- | --- |
-| 1 | Choose the FQDN (`headlamp.k8s.example.com`) and set it as both `hostname` and the host in `callbackURL`. |
-| 2 | **Publish a DNS A record** for that FQDN pointing at the Gateway's `ADDRESS`. Reserve the IP with your load-balancer provider so it is stable. |
-| 3 | **Register `https://<FQDN>/oidc-callback` as an authorized redirect URI** with your identity provider. Most providers reject unregistered redirects outright. |
+| `oidc.issuerURL` | Must match the token's `iss` claim byte for byte, trailing slash included, and match the API server's issuer URL. |
+| `oidc.clientID` | Must also appear in the API server's `audiences` list. If it does not, users authenticate successfully and then fail every API call, which looks like a broken UI and is not. |
+| `oidc.clientSecret` | Plaintext in etcd and in any repository holding the manifest. Check your release's schema for a secret-reference field, and manage the Secret with sealed-secrets, external-secrets, or the `vault-injector` addon. |
+| `oidc.callbackURL` | Must be registered at the provider, and its host must equal `hostname`. |
+| `oidc.scopes` | `openid` is required by the spec. `email` is load-bearing, because the API server maps the email claim to the Kubernetes username; drop the scope and login appears to work while authorization fails everywhere. If you change the API server's `username.claim`, request the matching scope here. |
+| TLS | The addon creates a cert-manager `Issuer` and `Certificate` and terminates TLS automatically, so you get HTTPS with no configuration. It is self-signed. See [Appendix B.2](#b2-a-trusted-certificate-for-the-ui). |
+| `gateway.create: true` | The addon owns the object, so hand edits are reverted on the next reconcile. Customise through `AddonConfig` values, or set `create: false` and manage the `Gateway` yourself. |
 
-Do all three and you can apply the whole manifest at once, because nothing depends on discovering
-an IP after the fact.
+Logging in successfully grants no permissions. [Section 7.7](#77-identity-oidc-and-rbac) covers the
+RBAC side, which is not optional.
 
-#### Headlamp field reference
+### 6.6 The rest of the catalogue
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `hostname` | The FQDN the UI is served on, and the `Gateway` listener's hostname. | Must match the `callbackURL` host and a published DNS record. An IP-derived hostname breaks whenever the IP changes — taking DNS, the callback, and the IdP registration with it. |
-| `gatewayApi.enabled` | Routes via Gateway API (`Gateway`/`HTTPRoute`) rather than the legacy `Ingress` resource. The correct modern choice. | CRDs are platform-provided, so nothing to install — but a controller is still required. |
-| `gatewayApi.gateway.className` | Binds the Gateway to a controller: `istio`, or the equivalent class for Contour. | See the prerequisite callout. A class with no controller stays unprogrammed silently. |
-| `gatewayApi.gateway.create` | `true` — the addon creates and manages the `Gateway`, including its LoadBalancer. | The addon **owns** the object; hand-edits are reverted on the next reconcile. To customise it (a different TLS certificate, extra listeners), do so through `AddonConfig` values, or set `create: false` and manage the `Gateway` yourself. |
-| **TLS** | The addon creates a cert-manager `Issuer` and `Certificate` and terminates TLS on the Gateway listener automatically — you get HTTPS with no configuration. | **The issuer is self-signed**, so browsers show a warning and strict clients may refuse the OIDC redirect. For production, issue from a **trusted CA** — see [Appendix B.2](#b2-trusted-tls-for-the-headlamp-gateway). Verify what you have: `kubectl get certificate,issuer -n headlamp`. |
-| `oidc.issuerURL` | The OIDC issuer, used for discovery and to validate the `iss` claim. | **Must match byte-for-byte, including any trailing slash**, and must equal the API server's `extraAuthentication.jwt[].issuer.url`. |
-| `oidc.clientID` | The OIDC client that mints ID tokens for UI logins. | **The most important cross-reference in the manifest.** It must also appear in the API server's `audiences` list, or the API server rejects the tokens Headlamp obtains: users log in successfully and then hit permission errors on every call. |
-| `oidc.clientSecret` | The client secret for the authorization-code flow. | **Plaintext** in etcd and in any repository holding the manifest. See [Pitfall 3](#3-oidc-client-secret-in-plaintext). |
-| `oidc.callbackURL` | The post-authentication redirect target. | Must be registered with the IdP, and its host must equal `hostname`. Failures appear on the provider's error page, not in Kubernetes. |
-| `oidc.scopes` | `openid` is required by the spec. `email` requests the email claim. `profile` requests name and picture. | **`email` is load-bearing.** The API server maps the `email` claim to the Kubernetes username. Drop the scope and the claim is absent, so username mapping fails — login appears to work while authorization fails everywhere. If you change the API server's `username.claim`, request the matching scope here. |
+`vcf addon available list` shows what your environment offers. None of the following is a blanket
+recommendation; what belongs in your cluster depends on what you already run elsewhere.
 
-> **Authentication is not authorization — you must also create RBAC.**
->
-> Configuring OIDC proves *who* a user is. It grants them **nothing**. A user who logs into
-> Headlamp successfully with no RBAC binding sees permission errors everywhere and will report the
-> UI as broken.
->
-> You need at least one RBAC binding **inside the workload cluster** naming the fully composed
-> username — the `prefix` from the API server's `claimMappings.username.prefix` concatenated with
-> the claim value:
->
-> ```yaml
-> # applied INSIDE the workload cluster, not the vSphere Namespace
-> apiVersion: rbac.authorization.k8s.io/v1
-> kind: ClusterRoleBinding
-> metadata:
->   name: oidc-admin
-> subjects:
-> - kind: User
->   name: "oidc:user@example.com"      # ← prefix + email claim, exactly
->   apiGroup: rbac.authorization.k8s.io
-> roleRef:
->   kind: ClusterRole
->   name: cluster-admin                # ← prefer a least-privilege role
->   apiGroup: rbac.authorization.k8s.io
-> ```
->
-> Confirm the exact string the API server sees with `kubectl auth whoami`. Full guidance, including
-> group-based bindings and least privilege, is in [Appendix B.1](#b1-rbac-for-oidc-identities).
+Three of them come up in almost every production conversation and are covered separately in
+[Appendix C](#appendix-c-integrations-that-need-an-external-system), because each needs a decision
+about an external system before it does anything: `velero` for backup, `fluent-bit` for log
+forwarding, `external-dns` for DNS automation.
+
+| Addon | When it fits |
+| --- | --- |
+| `contour` | A focused HTTP ingress controller, lighter than Istio if you want ingress and nothing more. Also a valid `className` provider for the Headlamp Gateway. |
+| `ako` | NSX Advanced Load Balancer integration for L4-L7. The right answer if NSX ALB is already your standard. Requires NSX ALB. |
+| `multus-cni` | Multiple network interfaces per pod. Standard for NFV and telco workloads, or anything needing a data plane separate from cluster traffic. |
+| `whereabouts` | Cluster-wide IPAM for secondary interfaces. Effectively required alongside `multus-cni`, since without it secondary addressing does not coordinate across nodes. |
+| `sriov-network-device-plugin` | Exposes SR-IOV virtual functions as schedulable resources for high-throughput, low-latency workloads. |
+| `nfs-client` | An NFS CSI driver, for `ReadWriteMany` volumes that vSphere block storage does not provide. |
+| `vault-injector` | Injects secrets from HashiCorp Vault into pods. A better answer to credential handling than Kubernetes Secrets alone. Requires an existing Vault. |
+| `harbor` | An in-cluster OCI registry with scanning, signing, and replication. Worth considering as a supply-chain control point; needs storage and its own lifecycle. |
+| `telegraf` | Metric collection and forwarding, for pushing to an external TSDB such as InfluxDB. Requires an output target. |
+| `gatekeeper`, `policy-bundle` | OPA Gatekeeper and VMware's curated compliance policies. Relevant with a specific compliance target; Pod Security already covers pod privilege. |
+| `windows-gmsa-webhook` | Group Managed Service Account support for Windows containers. |
+| `vsphere-pv-csi-webhook` | Additional validation for the vSphere CSI provider. |
+
+Every addon is a workload. Each consumes CPU, memory, and a pod slot on every node it DaemonSets
+onto, and each is another component to upgrade and troubleshoot. Add what you will operate.
 
 ---
 
-### 6.6 Additional addons worth considering
-
-The five above are a good baseline. The catalogue is larger — list yours with
-`vcf addon available list`. The additions below are the ones most often missing from a stack that
-is otherwise production-ready.
-
-The catalogue is larger than the five above — list yours with `vcf addon available list`. Nothing
-here is a blanket recommendation: which of these belongs in your cluster depends entirely on what
-you already run elsewhere.
-
-Three of them — backup, log forwarding, and DNS automation — are frequently valuable but need
-environment-specific decisions before they do anything useful, so they are written up separately in
-[Appendix D](#appendix-d--optional-integrations-requiring-environment-specific-setup).
-
-#### Ingress and load balancing
-
-| Addon | When to choose it |
-| --- | --- |
-| **`contour`** | A focused HTTP ingress controller. Lighter than Istio if you want ingress and nothing more. Also a valid `className` provider for the Headlamp Gateway. |
-| **`ako`** | Integrates NSX Advanced Load Balancer (Avi) for L4–L7. The right choice if NSX ALB is already your standard — enterprise LB features, WAF, and GSLB rather than a basic VIP. Requires NSX ALB. |
-
-#### Networking extensions
-
-| Addon | Use case |
-| --- | --- |
-| **`multus-cni`** | Attaches multiple network interfaces to a pod. A standard requirement for NFV, telco, and workloads needing a data plane separate from cluster traffic. |
-| **`whereabouts`** | Cluster-wide IPAM for secondary interfaces. Effectively required alongside `multus-cni` — without it, secondary-interface addressing does not coordinate across nodes. |
-| **`sriov-network-device-plugin`** | Exposes SR-IOV virtual functions as schedulable resources for high-throughput, low-latency workloads. |
-
-#### Storage, secrets, registry, and specialised
-
-| Addon | Use case |
-| --- | --- |
-| **`nfs-client`** | An NFS CSI driver. Useful when you need `ReadWriteMany` volumes, which vSphere block storage does not provide. |
-| **`vault-injector`** | Injects secrets from HashiCorp Vault into pods. A stronger answer to secret handling than Kubernetes Secrets alone, and directly relevant to the `clientSecret` issue in [Pitfall 3](#3-oidc-client-secret-in-plaintext). Requires an existing Vault deployment. |
-| **`harbor`** | An in-cluster OCI registry with image scanning, signing, and replication. Worth considering if you want a supply-chain control point inside the cluster; needs storage capacity and its own lifecycle. |
-| **`telegraf`** | Metric collection and forwarding. Complements Prometheus when you need to push to an external TSDB such as InfluxDB. Requires an output target. |
-| **`gatekeeper`** / **`policy-bundle`** | OPA Gatekeeper for admission policy, and VMware's curated compliance policies. Relevant if you have a specific compliance target; otherwise Pod Security Standards already cover pod privilege. |
-| **`windows-gmsa-webhook`** | Group Managed Service Account support for Windows containers. Only if you run Windows nodes. |
-| **`vsphere-pv-csi-webhook`** | Additional validation for the vSphere CSI provider. |
-
-> **Every addon is a workload.** Each consumes CPU, memory, and pod slots on every node it
-> DaemonSets onto, and each is another component to upgrade and troubleshoot. Add what you will
-> operate, not everything available.
-
----
-
-## 7. The `Cluster` object, annotated
-
-> **What this covers.** Every field of the `Cluster` object — networking, node shape, storage,
-> certificates, etcd, Pod Security, OIDC, CNI, and the node pool.
->
-> **Why it matters.** This is the densest and most consequential part of the manifest. It holds the
-> decisions you cannot reverse, the settings with the widest blast radius, and the one outright logic
-> error in the profile. If you read one section closely, read this one.
-
-### 7.1 Metadata and cluster networking
+## 7. The cluster
 
 ```yaml
-apiVersion: cluster.x-k8s.io/v1beta2      # ← upstream Cluster API, not the VKS addon group
+apiVersion: cluster.x-k8s.io/v1beta2      # upstream Cluster API
 kind: Cluster
 metadata:
-  name: <CLUSTER_NAME>                    # ← must match every addon selector above
-  namespace: <VSPHERE_NAMESPACE>          # ← same vSphere Namespace as the addons
+  name: <CLUSTER_NAME>                    # matches every addon selector
+  namespace: <VSPHERE_NAMESPACE>
+```
+
+VKS builds on standard Cluster API, so upstream CAPI concepts and troubleshooting apply directly. Do
+not confuse this API group with the `addons.kubernetes.vmware.com` group from section 6.
+
+Renaming a cluster is a rebuild, not an operation: the name is embedded in every addon selector and
+every `AddonConfig` name.
+
+### 7.1 Pod and service networking
+
+```yaml
 spec:
   clusterNetwork:
     pods:
       cidrBlocks:
-      - 240.0.0.0/20                      # ← reserved "Class E" space; see 7.1.1
+      - 240.0.0.0/20
     serviceDomain: cluster.local
     services:
       cidrBlocks:
       - 240.1.0.0/20
 ```
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `apiVersion` | Upstream Cluster API. VKS builds on standard CAPI, so upstream concepts and troubleshooting apply directly. | Do not confuse this group with `addons.kubernetes.vmware.com` used above. |
-| `metadata.name` | The cluster's identity, and the value every `AddonInstall` selector matches. | Renaming is a rebuild, not an operation. |
-| `pods.cidrBlocks` | The pool pod addresses are allocated from. | The most consequential number in the manifest — see 7.1.1. |
-| `services.cidrBlocks` | The pool for `ClusterIP` Services. `/20` gives ~4,094 usable service IPs. | Must not overlap the pod CIDR — these do not (pods occupy `240.0.0.0`–`240.0.15.255`, services `240.1.0.0`–`240.1.15.255`) — nor anything routable in your datacenter. **Immutable.** |
-| `serviceDomain` | The internal DNS suffix. `cluster.local` is the universal default. | Changing it breaks anything assuming `.cluster.local`, and would need to be matched by Istio's trust domain if you ever adopt the mesh. Leave it alone. |
+Both CIDRs are immutable after creation. The service range caps total `ClusterIP` services, and a
+`/20` gives about 4,094 of them, which is rarely the constraint. The pod range needs more thought.
 
-> **Why `240.0.0.0/4`?** That range is IANA-reserved ("Class E") and not routable on the public
-> internet or, normally, inside a datacenter. Using it for pod and service networks **guarantees no
-> collision with routable RFC1918 space** (`10/8`, `172.16/12`, `192.168/16`) elsewhere in your
-> environment — which matters when pods reach on-premises systems, and when you may later peer or
-> federate clusters. Overlapping CIDRs are among the hardest problems to unpick after the fact, so
-> this is genuinely good practice.
->
-> **Validate it before adopting it.** Because the range is reserved, some CNIs, OS network stacks,
-> hardware load balancers, and firewalls reject or mishandle Class E addresses. It works with
-> Antrea; confirm it against every appliance in the path.
+`serviceDomain` is the cluster's internal DNS suffix. `cluster.local` is the universal default and
+changing it breaks anything that assumes it, including Istio's trust domain if you later adopt the
+mesh. Leave it alone.
 
-### 7.1.1 Pod CIDR sizing: node blocks, `maxPods`, and the upgrade spare
+#### Why 240.0.0.0/4
 
-> **`clusterNetwork.pods.cidrBlocks` is immutable after cluster creation.** Get it wrong and the
-> remedy is a new cluster. Read this before accepting `240.0.0.0/20`.
+That range is IANA-reserved and not routable on the public internet or, normally, inside a
+datacenter. Using it for pod and service networks guarantees no collision with routable RFC1918
+space, which matters when pods reach on-premises systems and when you may later peer or federate
+clusters. Overlapping CIDRs are among the hardest problems to unpick after the fact, so this is a
+good habit.
 
-#### Allocation happens at two levels
+Validate it before adopting it, though. Because the range is reserved, some CNIs, OS network stacks,
+hardware load balancers, and firewalls reject or mishandle it. It works with Antrea; confirm it
+against every appliance in the path.
 
-The second level is what creates the limit, and it is the part that surprises people.
+#### How pod addresses are actually allocated
 
-1. **Cluster level.** `pods.cidrBlocks` defines one pool for the whole cluster.
-2. **Node level.** As each node joins, the node IPAM controller carves a **fixed-size block out of
-   that pool and assigns it to that node** (`Node.spec.podCIDR`). The block is **dedicated** to
-   that node — pods elsewhere cannot draw from it, even when it sits mostly empty. The CNI then
-   allocates pod IPs only from the block its own node owns.
+Allocation happens at two levels, and the second one is what creates the limit.
 
-The per-node block size defaults to **`/24`** (256 addresses) for IPv4. So the cluster pool is not
-a flat pool of pod IPs — it is a **pool of per-node `/24` blocks**. Run out of blocks and adding
-nodes stops working.
+The cluster CIDR defines one pool. As each node joins, the node IPAM controller carves a fixed-size
+block out of that pool and assigns it to that node, visible as `Node.spec.podCIDR`. The block belongs
+to that node; pods elsewhere cannot draw from it even when it sits mostly empty. The CNI then
+allocates pod IPs only from the block its own node owns.
+
+The per-node block defaults to a `/24`. So the cluster CIDR is not a flat pool of pod IPs, it is a
+pool of per-node `/24` blocks, and running out of blocks stops you adding nodes:
 
 ```
-240.0.0.0/20  →  4096 addresses  →  2^(24−20) = 16 blocks of /24
+240.0.0.0/20  =  4096 addresses  =  2^(24-20) = 16 blocks
 ```
 
-**16 blocks is your total node budget — control plane and workers combined.** Not 16 workers.
-
-You can see the allocation on any running cluster:
+Sixteen blocks is the whole cluster's node budget, control plane included. You can see the allocation
+on any running cluster:
 
 ```bash
+# Workload cluster context.
 kubectl get nodes -o custom-columns='NODE:.metadata.name,POD_CIDR:.spec.podCIDR,MAXPODS:.status.capacity.pods'
 ```
 
 ```
-NODE                                POD_CIDR       MAXPODS
-<cluster>-8dbnf-tf6pb               240.0.0.0/24   110      ← control plane: block 1
-<cluster>-node-pool-1-...-m9b9p     240.0.1.0/24   110      ← worker:        block 2
+NODE                              POD_CIDR       MAXPODS
+<cluster>-8dbnf-tf6pb             240.0.0.0/24   110      control plane, block 1
+<cluster>-node-pool-1-...-m9b9p   240.0.1.0/24   110      worker, block 2
 ```
 
-#### Reserve at least one spare block for upgrades
+#### Keep a spare block for upgrades
 
-Every rolling operation in Cluster API is **surge-then-remove**: a replacement node is created and
-brought to `Ready` *before* the node it replaces is deleted. A `MachineDeployment` rolling update
-defaults to `maxSurge: 1`, and a control-plane rollout likewise scales up before scaling down. For
-the duration of that overlap the cluster runs **N + 1 nodes**, and that extra node needs a block of
-its own.
+Every rolling operation in Cluster API creates the replacement node before deleting the one it
+replaces. A `MachineDeployment` rolling update defaults to `maxSurge: 1`, and a control-plane rollout
+scales up before scaling down. For the duration of that overlap the cluster runs N+1 nodes, and the
+extra node needs a block.
 
-**If every block is allocated, the surge node has no pod CIDR to receive.** It joins, may report
-`Ready`, and hosts nothing — pods scheduled to it stay `Pending`. The rollout neither completes nor
-cleanly fails; it stalls with the cluster in a mixed-version state.
+If every block is allocated, the surge node has nowhere to get a pod CIDR. It joins, may report
+`Ready`, and hosts nothing. The rollout neither completes nor fails cleanly; it stalls with the
+cluster in a mixed-version state. Since the pod CIDR is immutable, a cluster that has consumed every
+block cannot be upgraded out of the situation either.
 
-> **A cluster that has consumed its entire pod CIDR cannot be upgraded — and because the pod CIDR
-> is immutable, it cannot be fixed in place either.** Running to the block limit paints you into a
-> corner you can only leave by rebuilding.
+This applies to every rolling node replacement, not just version changes. A `vmClass` change, a
+`volumes` resize, a `maxPods` change, and an OS image change all need the spare block.
 
-This applies to **every** rolling node replacement, not just version upgrades: a `vmClass` change,
-a `volumes` resize, and an OS image change all need the spare block
-([which changes replace nodes](#which-changes-replace-nodes)).
+Reserve one at minimum. Reserve one per pool that may roll concurrently, one per surge slot if your
+rollout strategy allows more than one, and in practice keep two or three plus room for pools you have
+not created yet. Block reclamation is not instant either: a node stuck `Terminating` holds its block,
+so at zero margin one stuck node blocks the whole rollout.
 
-| Situation | Spare blocks to reserve |
-| --- | --- |
-| Minimum, ever | **1** |
-| Multiple machine deployments that may roll concurrently | 1 per pool rolling at once |
-| A rollout strategy with `maxSurge` above 1 | 1 per surge slot |
-| **Recommended working margin** | **2–3**, plus blocks for pools you have not created yet |
+#### maxPods, and the density lever
 
-A second reason not to run to the edge: **block reclamation is not instantaneous.** A deleted
-node's block is released when its `Node` object is removed, so a node stuck `Terminating` holds its
-block meanwhile. At zero margin, one stuck node blocks the whole rollout.
-
-#### `maxPods` — new in ClusterClass 3.7, and the lever for pod density
-
-The per-node block also bounds pods per node, but a kubelet setting usually binds first. **VKS 3.7
-exposes it as a ClusterClass variable**, which earlier generations did not:
+The per-node block also bounds pods per node, but a kubelet setting usually binds first. VKS 3.7
+exposes it as a ClusterClass variable, which earlier generations did not:
 
 ```yaml
         kubeletConfiguration:
-          maxPods: 250        # default 110; documented maximum 250; minimum 20
+          maxPods: 250        # default 110, documented maximum 250, minimum 20
 ```
 
-Verify the constraints for your ClusterClass directly:
-
 ```bash
-# jsonpath renders string fields with real newlines, so this reads cleanly.
-# Keep only the path in the variable — never flags, which would rely on word
-# splitting and breaks under zsh.
 MP='.status.variables[?(@.name=="kubernetes")].definitions[0].schema.openAPIV3Schema.properties.kubeletConfiguration.properties.maxPods'
-
 kubectl get clusterclass builtin-generic-v3.7.0 -n vmware-system-vks-public \
   -o jsonpath="{$MP.description}{\"\nminimum: \"}{$MP.minimum}{\"\n\"}"
 ```
@@ -1344,391 +896,459 @@ NOTE: By default, the maximum allowed value is 250.
 minimum: 20
 ```
 
-**Why this matters against the CIDR arithmetic:**
+At the default of 110, roughly 43% of each `/24` is used and the kubelet refuses the 111th pod long
+before addresses run out. At 250 the block becomes the binding limit, with about 254 usable addresses
+against 250 pods.
 
-| `maxPods` | Pods per node | Usable IPs in a `/24` | Which limit binds | Block utilisation |
-| --- | --- | --- | --- | --- |
-| `110` (default) | 110 | ~254 | **kubelet** | ~43% — over half the block is never used |
-| `250` (maximum) | 250 | ~254 | **the `/24` block** — essentially exactly matched | ~98% |
-
-This gives you a genuine lever: **raising `maxPods` increases pod capacity without consuming
-additional blocks.** On a cluster already constrained to a `/20`, going from `110` to `250` takes
-the ceiling from ~1,650 pods to ~3,750 — with no change to the immutable CIDR.
-
-It is not free:
-
-| Consideration | Detail |
-| --- | --- |
-| **Node resources must support it** | 250 pods on a 2-vCPU / 8 GiB node is not realistic. Size the VM class to the pod count — and remember each pod carries kubelet, CRI, and networking overhead beyond its own requests. |
-| **Reserve resources for the system** | At high pod density, kubelet and runtime overhead grows materially — and VKS's automatic reservation is derived from **node size, not pod count**, so it does not grow with `maxPods`. Override `resourceConfiguration.systemReserved` explicitly; [7.13](#713-37-variables-not-used-in-the-sample) has the published formulas and a per-VM-class table. |
-| **Blast radius** | 250 pods per node means losing a node evicts 250 pods at once. Fewer, denser nodes concentrate risk; more, smaller nodes spread it — at one block each. |
-| **DaemonSet cost is per node, not per pod** | Denser nodes mean fewer DaemonSet copies, which is a real efficiency gain when you run several. |
-| **Rollout time** | Draining a 250-pod node takes considerably longer than a 110-pod node. Upgrades get slower. |
-| **`/24` becomes the binding limit at 250** | With ~254 usable addresses there is almost no headroom. Pod IP churn from short-lived pods can transiently exhaust a node's block. Do not plan to exceed ~220–230 sustained per node on a `/24`. |
-| **Changing it later** | `kubeletConfiguration` changes **require a machine rollout** — which needs a spare block. |
+That gives you a lever. Raising `maxPods` increases pod capacity without consuming more blocks, so a
+cluster already fixed at a `/20` can go from roughly 1,650 pods to 3,750 without touching the
+immutable CIDR. It is not free, and [7.3](#73-node-sizing) covers what the node has to look like to
+support it.
 
 #### Sizing table
 
-Assumes default `/24` per-node blocks and one reserved surge block.
+Assumes default `/24` blocks and one reserved surge block.
 
-| Pod CIDR | Addresses | `/24` blocks | Steady-state nodes | Pod ceiling @ `maxPods 110` | @ `maxPods 250` |
+| Pod CIDR | Addresses | Blocks | Steady-state nodes | Pods at 110 | Pods at 250 |
 | --- | --- | --- | --- | --- | --- |
 | `/22` | 1,024 | 4 | 3 | 330 | 750 |
 | `/21` | 2,048 | 8 | 7 | 770 | 1,750 |
-| **`/20`** | **4,096** | **16** | **15** | **1,650** | **3,750** |
+| `/20` | 4,096 | 16 | 15 | 1,650 | 3,750 |
 | `/19` | 8,192 | 32 | 31 | 3,410 | 7,750 |
 | `/18` | 16,384 | 64 | 63 | 6,930 | 15,750 |
 | `/17` | 32,768 | 128 | 127 | 13,970 | 31,750 |
-| **`/16`** | **65,536** | **256** | **255** | **28,050** | **63,750** |
+| `/16` | 65,536 | 256 | 255 | 28,050 | 63,750 |
 
-#### What a `/20` means for real cluster shapes
+Applied to real cluster shapes, a `/20` gives:
 
-| Cluster shape | Nodes | Blocks used | Left over on a `/20` | Verdict |
-| --- | --- | --- | --- | --- |
-| **The sample:** 1 CP + 5 workers (autoscaler max) | 6 | 6 + 1 surge = 7 | 9 | Comfortable |
-| **Production shape:** 3 CP + 10 workers | 13 | 13 + 1 surge = 14 | 2 | **Too tight** — one extra pool or one stuck node and you are stuck |
-| Same, plus a 5-node GPU pool | 18 | 18 + 1 = 19 | — | **Does not fit** |
+| Shape | Nodes | Blocks used | Spare on a `/20` |
+| --- | --- | --- | --- |
+| The reference profile: 1 control plane, 5 workers | 6 | 7 with surge | 9 |
+| A production shape: 3 control plane, 10 workers | 13 | 14 with surge | 2 |
+| The same, plus a 5-node GPU pool | 18 | 19 with surge | does not fit |
 
-The sample is fine as written. The trap is that it looks like a template, and the production shape
-it should grow into **does not fit a `/20`** with real margin — while the field you would need to
+The profile is fine as written. The difficulty is that it is easy to treat as a template, and the
+shape it should grow into does not fit a `/20` with any margin, while the field you would need to
 change is the one you no longer can.
-
-#### What else eats the per-node budget
-
-- **DaemonSets consume a slot on every node, permanently.** This stack runs at least the CNI agent
-  and node-exporter everywhere, so a few of each node's slots are gone before an application pod
-  lands. Every DaemonSet you add costs one slot per node forever.
-- **Short-lived pods hold IPs briefly after termination.** High-churn CI runners, Jobs, and
-  CronJobs can pressure a node's block well above its steady-state pod count.
-- **Sidecars cost containers, not pods or IPs.** If you later adopt the Istio mesh, sidecars share
-  their pod's IP and consume no extra slot. Service mesh will not exhaust your CIDR.
 
 #### Recommendation
 
-**Use a `/16` unless you have a specific reason not to.** Drawn from reserved `240.0.0.0/4` space,
-address scarcity is not a real constraint — these addresses are not routable outside the cluster
-and compete with nothing. A `/16` gives 255 nodes and removes the entire class of problem at no
-cost.
+Use a `/16` unless you have a specific reason not to. Drawn from reserved space, address scarcity is
+not a real constraint; these addresses are not routable outside the cluster and compete with nothing.
+A `/16` gives 255 nodes and removes the whole class of problem.
 
-If you must use a smaller block:
+If you must use something smaller, size for your maximum plausible node count including future pools,
+add the surge reserve on top, and cross-check the total against every autoscaler maximum plus
+`controlPlane.replicas`. Then alert on block allocation rather than on scheduling failures: "12 of 16
+blocks used" is actionable, and discovering it during a stalled upgrade is not.
 
-1. Size for **maximum plausible node count**, including future pools for GPU or memory-optimised
-   workloads.
-2. **Add the surge reserve on top** — 2–3 blocks, not the bare minimum of 1.
-3. **Cross-check against every `autoscaler-node-group-max-size` plus `controlPlane.replicas`.**
-4. **Consider raising `maxPods`** to buy pod density without buying blocks — sizing the VM class and
-   `systemReserved` accordingly ([7.13](#713-37-variables-not-used-in-the-sample)).
-5. **Alert on block allocation**, not just on scheduling failures. "12 of 16 blocks used" is
-   actionable; discovering it during a stalled upgrade is not.
+```bash
+# Workload cluster context.
+kubectl get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}' | sort -u | wc -l
+```
 
-#### If you are already on a `/20`
+Other things that consume the per-node budget: DaemonSets take a slot on every node permanently, so
+the CNI agent and node-exporter are gone before an application pod lands. Short-lived pods hold IPs
+briefly after termination, so high-churn CI runners and CronJobs can pressure a block well above
+steady state. Istio sidecars, if you adopt the mesh, cost containers rather than pods or IPs.
 
-- Compute the real ceiling: `16 − controlPlane.replicas − surge reserve` = maximum workers, summed
-  across all pools. Cap every autoscaler `max-size` at or below it.
-- Audit before any rolling operation:
-  ```bash
-  # how many blocks are in use
-  kubectl get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}' | sort -u | wc -l
-  ```
-  **Confirm at least one free block before starting.**
-- Prefer fewer, larger nodes with a higher `maxPods`. Vertical scaling costs no blocks; horizontal
-  scaling costs one each. Note that changing `vmClass` or `maxPods` is itself a rolling
-  replacement, so it needs the spare block too.
-
-### 7.2 Topology and ClusterClass
+### 7.2 ClusterClass and version
 
 ```yaml
   topology:
     classRef:
-      name: builtin-generic-v3.7.0            # ← VMware-supplied ClusterClass
-      namespace: vmware-system-vks-public     # ← VMware-managed namespace
+      name: builtin-generic-v3.7.0
+      namespace: vmware-system-vks-public
+    version: v1.36.1---vmware.4-vkr.5
 ```
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `classRef.name` | The ClusterClass is the template that turns a short `Cluster` spec into full infrastructure. Version-paired with the VKS release. | **The ClusterClass defines which `topology.variables` exist.** Every variable below is valid only because this class declares it — the set is not portable across ClusterClass versions. |
-| `classRef.namespace` | `vmware-system-vks-public` holds VMware-provided, read-only ClusterClasses. | Do not modify objects in `vmware-system-*` namespaces. They are platform-managed; changes are reverted and can block upgrades. |
+The ClusterClass is the template that turns a short `Cluster` spec into full infrastructure. It is
+VMware-supplied, read-only, and version-paired with the VKS release. Objects in `vmware-system-*`
+namespaces are platform-managed; edits get reverted and can block upgrades.
 
-**Inspect your own ClusterClass rather than copying variables hopefully.** The variable set is
-published in `status.variables`:
+The important consequence is that the ClusterClass defines which `topology.variables` exist. The
+variable set below is valid because this class declares it, and is not portable across ClusterClass
+versions:
 
 ```bash
-# which variables exist on this ClusterClass
 kubectl get clusterclass builtin-generic-v3.7.0 -n vmware-system-vks-public \
   -o jsonpath='{range .status.variables[*]}{.name}{"\n"}{end}'
 ```
-
-For `builtin-generic-v3.7.0` that returns ten:
 
 ```
 bootstrapAddons   kubeAPIServerFQDNs   kubernetes   node   osConfiguration
 resourceConfiguration   storageClass   vmClass   volumes   vsphereOptions
 ```
 
-**The sample manifest uses seven of them.** `node`, `resourceConfiguration`, and
-`kubeAPIServerFQDNs` are unused — see [7.13](#713-37-variables-not-used-in-the-sample). Note that
-`kubeAPIServerFQDNs` is marked deprecated in the schema in favour of `kubernetes.endpointFQDNs`.
+Ten variables; the profile uses seven. `node` and `resourceConfiguration` are both worth adding and
+appear below. `kubeAPIServerFQDNs` is marked deprecated in the schema in favour of
+`kubernetes.endpointFQDNs`, so migrate if you have manifests using it.
 
-To read the full schema for one variable, including descriptions, defaults, and constraints:
+To read one variable's full schema, including descriptions and constraints:
 
 ```bash
-# the whole schema for one variable (add `| jq` or `| yq` if you want it indented)
 kubectl get clusterclass builtin-generic-v3.7.0 -n vmware-system-vks-public \
   -o jsonpath='{.status.variables[?(@.name=="kubernetes")].definitions[0].schema.openAPIV3Schema}' | less
-
-# or read the descriptions field by field, which is usually what you want
-kubectl explain cluster.spec.topology.variables
 ```
 
-> **The upgrade implication.** Because the ClusterClass is version-pinned in the manifest, moving to
-> a newer VKS generation is a deliberate act, and the new class may add, rename, or remove
-> variables. **Diff the two variable schemas before the upgrade**, not after a failed apply.
+Because the ClusterClass is version-pinned in the manifest, moving to a newer VKS generation is a
+deliberate act, and the new class may add, rename, or remove variables. Diff the two schemas before
+the upgrade rather than after a failed apply.
 
-### 7.3 Control plane
+### 7.3 Node sizing
+
+VM class, node volumes, system reservations, and `maxPods` are one decision, not four. Treating them
+separately is how you end up with a node that admits 250 pods and has 20 MiB of memory for each.
+
+```yaml
+    variables:
+    - name: storageClass
+      value: <STORAGE_CLASS>              # the nodes' own disks
+    - name: vmClass
+      value: guaranteed-medium
+    - name: volumes
+      value:
+      - capacity: 30Gi
+        mountPath: /var/lib/containerd
+        name: containerd
+        storageClass: <STORAGE_CLASS>
+      - capacity: 30Gi
+        mountPath: /var/lib/kubelet
+        name: kubelet
+        storageClass: <STORAGE_CLASS>
+```
+
+#### VM class: reserve resources in production
+
+The VM class sets each node's CPU and memory shape and, critically, whether those resources are
+reserved.
+
+`best-effort-*` classes request without reserving. Under vSphere contention the VM is not guaranteed
+the CPU and memory it advertises to Kubernetes. `guaranteed-*` classes reserve.
+
+The reason to be firm about this in production is how the failure presents, not how severe it is.
+Kubernetes still believes the node has its full allocatable capacity and schedules accordingly, while
+the hypervisor quietly delivers less. What you see is `NotReady` kubelets, etcd leader-election churn,
+failing liveness probes, and random timeouts. Those symptoms point at Kubernetes, so that is where
+people investigate, and meanwhile capacity planning based on Kubernetes' view of the node is wrong.
+
+Use `best-effort` for dev and test, where density matters more than predictability. Use `guaranteed`
+for production, and for the control plane at any tier.
+
+A default catalogue, which you should confirm with `kubectl get virtualmachineclass`:
+
+| Class | vCPU | Memory | Typical use |
+| --- | --- | --- | --- |
+| `guaranteed-small` | 2 | 4 GiB | Minimal workers |
+| `guaranteed-medium` | 2 | 8 GiB | General-purpose workers |
+| `guaranteed-large` | 4 | 16 GiB | Control plane, heavier workers |
+| `guaranteed-xlarge` | 4 | 32 GiB | Memory-intensive workloads |
+| `guaranteed-2xlarge` | 8 | 64 GiB | Large control planes, dense nodes |
+| `guaranteed-4xlarge` | 16 | 128 GiB | High-density nodes |
+
+Environments often define their own classes too. Where they do, the `best-effort` / `guaranteed`
+naming convention may not apply, so confirm whether a custom class actually reserves.
+
+Changing `vmClass` rebuilds every node in the pool.
+
+#### Dedicated containerd and kubelet volumes
+
+Keep this part of the profile. It is one of its better decisions.
+
+By default both directories sit on the node's root disk. `/var/lib/containerd` holds every image layer
+pulled onto the node; `/var/lib/kubelet` holds ephemeral pod storage, `emptyDir` volumes, and pod
+logs. Both grow in ways you do not directly control, so on a shared root disk one image-pull storm or
+a single pod writing large log volumes can fill the filesystem. When that happens the kubelet degrades,
+evicting pods under disk pressure and eventually ceasing to function. One misbehaving workload takes
+the node with it.
+
+Separate volumes contain that. A full containerd volume means image pulls fail, which is bad but
+diagnosable. A full root disk means the node is gone.
+
+30Gi is modest. Image-heavy workloads, AI/ML frameworks, large JVM or data-science images, and CUDA
+layers will exhaust it, and multiple image versions accumulate. Density matters too: a node running
+250 pods needs considerably more ephemeral space and image cache than one running 110.
+
+Size generously up front, because adding or resizing a volume is a rolling node replacement, not an
+in-place change. Every node in the pool is destroyed and rebuilt. That is survivable with a healthy
+multi-node pool and PodDisruptionBudgets, but it is slow, it needs a spare pod CIDR block, and with a
+single control-plane replica it is an outage.
+
+#### System reservations
+
+`resourceConfiguration.systemReserved` holds back CPU and memory for the kubelet, container runtime,
+and OS, so pods cannot starve them. Starved system daemons produce `NotReady` nodes and cascading
+evictions.
+
+```yaml
+    - name: resourceConfiguration
+      value:
+        systemReserved:
+          automatic: true
+```
+
+At the default `maxPods` of 110, leave `automatic: true` and move on. The upstream Kubernetes
+documentation on
+[reserving compute resources](https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/)
+publishes no recommended values, and advises enforcing `systemReserved` only after profiling nodes
+exhaustively, since an over-tight reservation can leave critical system services CPU starved, OOM
+killed, or unable to fork. Preferring the automatic calculation is the upstream position, not a
+hedge.
+
+Where public formulas do exist is at the managed providers, and they are useful because they quantify
+the two different things that drive overhead.
+[GKE](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/plan-node-sizes) and
+[EKS](https://docs.aws.amazon.com/batch/latest/userguide/memory-cpu-batch-eks.html) both reserve CPU
+as a tiered percentage of core count: 6% of the first core, 1% of the second, 0.5% of the third and
+fourth, 0.25% of anything above four. GKE reserves memory as a tiered percentage of node memory
+(25% of the first 4 GiB, 20% of the next 4, 10% of the next 8, 6% of the next 112, 2% above 128) plus
+100 MiB for eviction. EKS instead scales memory with pod count, at `(11 MiB x max_pods) + 255 MiB`.
+
+You can see what VKS actually does. The gap between `capacity` and `allocatable` is the total
+reservation plus the eviction threshold:
+
+```bash
+# Workload cluster context.
+kubectl get nodes -o custom-columns='NODE:.metadata.name,\
+CPU_CAP:.status.capacity.cpu,CPU_ALLOC:.status.allocatable.cpu,\
+MEM_CAP:.status.capacity.memory,MEM_ALLOC:.status.allocatable.memory,\
+MAXPODS:.status.capacity.pods'
+```
+
+Measured on a VKS 3.7 cluster with `automatic: true` and `maxPods: 110`:
+
+| Node | Capacity | Reserved | GKE formula predicts |
+| --- | --- | --- | --- |
+| 4 vCPU, 15.6 GiB | 4 / 15.6 GiB | 80m / 2722 MiB | 80m / 2723.2 MiB |
+| 2 vCPU, 7.75 GiB | 2 / 7.75 GiB | 70m / 1892 MiB | 70m / 1892.8 MiB |
+
+Exact on CPU and within about 1 MiB on memory, across two node sizes, once the 100 MiB eviction
+reserve is included. So the tiered model is a reliable predictor of what `automatic: true` will give
+you on a given VM class, which is useful for planning before a node exists. Two data points is a good
+fit rather than a guarantee, and VMware documents only the flag and not its calculation, so confirm
+against your own nodes.
+
+The gap appears when you raise `maxPods`. That reservation is derived from node size, not pod count,
+so going from 110 to 250 more than doubles the kubelet and runtime bookkeeping while the automatic
+figure does not move. Both providers acknowledge this: EKS scales memory at 11 MiB per pod, and GKE
+documents an extra 400 mCPU once pods per node exceed 110. Combining them gives a defensible starting
+point:
+
+```
+memory = automatic reservation for the VM class  +  11 MiB x (maxPods - 110)
+cpu    = tiered CPU reservation for the core count  +  400m   when maxPods > 110
+```
+
+```yaml
+    # a pool running maxPods: 250 on guaranteed-2xlarge (8 vCPU, 64 GiB)
+    - name: resourceConfiguration
+      value:
+        systemReserved:
+          automatic: false
+          cpu: 500m            # 90m tiered plus the 400m density adder
+          memory: 7Gi          # about 5.5Gi of node-size tiers plus 1.5Gi for 140 extra pods
+```
+
+#### What density costs
+
+Reserved resources come off allocatable, so reservation and pod count together decide what is left per
+pod. This is where an ambitious `maxPods` usually falls apart:
+
+| VM class | vCPU / memory | Reserved at 250 | Allocatable | Average memory per pod |
+| --- | --- | --- | --- | --- |
+| `guaranteed-medium` | 2 / 8 GiB | 470m / 3.35 GiB | 4.4 GiB | 18 MiB, unusable |
+| `guaranteed-large` | 4 / 16 GiB | 480m / 4.15 GiB | 11.4 GiB | 47 MiB, unrealistic |
+| `guaranteed-xlarge` | 4 / 32 GiB | 480m / 5.10 GiB | 25.9 GiB | 106 MiB, tight |
+| `guaranteed-2xlarge` | 8 / 64 GiB | 490m / 6.97 GiB | 55.1 GiB | 226 MiB, workable |
+| `guaranteed-4xlarge` | 16 / 128 GiB | 510m / 10.69 GiB | 113.5 GiB | 465 MiB, comfortable |
+
+So: raising `maxPods` to 250 means planning on `guaranteed-2xlarge` or larger. And CPU usually binds
+before memory, since 8 vCPU across 250 pods is about 29 millicores each, which suits many small
+services and nothing compute-bound. Size from your workload's actual requests rather than from the pod
+count.
+
+Other consequences of density worth weighing: losing a node evicts 250 pods rather than 110, so risk
+concentrates; draining a 250-pod node takes considerably longer, so upgrades slow down; and DaemonSet
+overhead is per node, so fewer denser nodes is a real efficiency gain if you run several. On a `/24`
+block there is almost no headroom at 250, so keep sustained density below roughly 220 to absorb pod IP
+churn.
+
+Set these per pool rather than cluster-wide, using the `variables.overrides` mechanism shown in
+[7.4](#74-control-plane), so a dense pool gets a large reservation without imposing it on pools that
+do not need one. Then measure: compare `capacity` against `allocatable` after deployment and watch
+actual kubelet and runtime usage under load. Every reserved core is capacity you paid for and cannot
+schedule, so do not over-reserve, but err high on memory and low on CPU. Memory is incompressible and
+exhausting it OOM-kills system processes, whereas CPU starvation degrades. Upstream makes the same
+point: reserving only compressible resources is less likely to cause disruption.
+
+One terminology note. Upstream splits reservations into `kube-reserved` for the kubelet and runtime
+and `system-reserved` for OS daemons. The provider formulas above are `kube-reserved`. VKS exposes a
+single `systemReserved` knob, so if you override it, size it for total node overhead and validate with
+the capacity-versus-allocatable check.
+
+#### Node labels
+
+```yaml
+    - name: node
+      value:
+        labels:
+          workload-type: general
+          environment: production
+```
+
+Use this rather than `kubectl label node`. Labels applied by hand are lost when a node is replaced,
+which happens on every upgrade, every `vmClass` change, and every `volumes` resize. Labels set here
+are part of the node's declared configuration and survive.
+
+Useful for scheduling with `nodeSelector` or affinity, for environment identification in dashboards
+and alerts, for cost attribution, and for scoping compliance controls. The variable also carries
+`taints`, `cri.runtimeClasses`, and `firewall.inboundRules`; reach for those when you have a concrete
+requirement rather than as part of a baseline.
+
+### 7.4 Control plane
 
 ```yaml
     controlPlane:
       metadata:
         annotations:
           run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-      replicas: 1                          # ← dev/test only: no HA, no etcd quorum
+      replicas: 1
       variables:
-        overrides:                         # ← per-pool override of a cluster-wide variable
+        overrides:
         - name: vmClass
-          value: guaranteed-large          # ← larger AND reserved: correct for a control plane
+          value: guaranteed-large
 ```
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `annotations[resolve-os-image]` | Selects the node OS image by attribute rather than a brittle image name. Ubuntu 24.04 is a current LTS with a long support horizon. **This is a label selector against `OSImage` objects, so you can test it in advance** — see [Appendix E.3](#e3-specosimages-and-the-osimage-object). | **Two traps.** (1) The selector must resolve to an image available *for your chosen release*, or machine creation stalls with a thin error surface. One command confirms it: `kubectl get osimage -l os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=<kr-name>` — expect exactly one match. (2) It must be set on the control plane **and every machine deployment**, or pools drift onto different OS images. |
-| `replicas: 1` | One control-plane node halves a lab's footprint. | **No high availability and no etcd quorum.** A single etcd member means any control-plane failure — or any rolling operation touching it — is a full API-server outage. Workloads already scheduled keep running (the dataplane survives), but nothing can be scheduled, scaled, or changed, and every controller stops reconciling. **Use 3 in production.** Scaling 1→3 later is supported but is a rolling change to plan into a window. |
-| `variables.overrides` | **A pattern worth learning.** Overrides a cluster-wide variable for just the control plane, so you can size it independently without duplicating the whole variable set. | An override silently shadows the cluster-wide value. When a node has unexpected resources, check for overrides here before assuming the cluster-wide variable applies. |
-| `vmClass: guaranteed-large` | **The right instinct, correctly executed.** The control plane runs etcd, which is latency-sensitive and intolerant of resource starvation — so it gets both a larger class *and* a reserved one. | `guaranteed-large` is 4 vCPU / 16 GiB in a default catalogue. That is a sound production control-plane size for small-to-medium clusters; scale up for high object counts or many nodes. |
+`replicas: 1` gives you no etcd quorum and no high availability. Any control-plane failure, or any
+rolling operation touching it, is a full API-server outage. Workloads already scheduled keep running
+and the dataplane survives, but nothing can be scheduled, scaled, or changed, and every controller
+stops reconciling. Use 3 in production. Going from 1 to 3 later is supported but is a rolling change
+to plan into a window.
 
-### 7.4 `storageClass`
+The `variables.overrides` block is a pattern worth learning. It overrides a cluster-wide variable for
+just the control plane, so you can size it independently without duplicating the whole variable set.
+The same mechanism works on machine deployments. One caveat: an override silently shadows the
+cluster-wide value, so when a node has unexpected resources, check here before assuming the
+cluster-wide variable applies.
 
-```yaml
-    variables:
-    - name: storageClass
-      value: <STORAGE_CLASS>                 # ← for node/system disks
+Giving the control plane both a larger and a reserved class is the right instinct, since etcd is
+latency-sensitive and intolerant of starvation. `guaranteed-large` at 4 vCPU and 16 GiB is a sound
+production size for small-to-medium clusters; scale up for high object counts or many nodes.
+
+The `resolve-os-image` annotation selects the node OS image by attribute rather than by a brittle
+image name. It is a label selector against `OSImage` objects, which means you can test it before
+applying:
+
+```bash
+kubectl get osimage -l os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=<kr-name>
 ```
 
-The StorageClass backing the cluster's own machine disks.
+Expect exactly one match. No match means the annotation never resolves and machine creation stalls
+with a thin error surface. [Appendix D](#appendix-d-reading-a-kubernetes-release-object) covers the
+label set and which OS images a release offers.
 
-| Consideration | Detail |
-| --- | --- |
-| Why it matters | Provisions the disks the nodes run on. Wrong or unavailable, and machines never come up. |
-| **Pitfall — namespace association** | A StorageClass that exists in vCenter but is **not associated with your vSphere Namespace** cannot be used. The `Cluster` object is accepted regardless; the failure appears later as machines that never provision. Verify with `kubectl describe ns <VSPHERE_NAMESPACE> \| grep storageclass` ([section 1](#1-prerequisites)). |
-| **Pitfall — protection-policy host count** | A RAID-5 or RAID-6 erasure-coding policy requires enough hosts to satisfy placement. On a smaller cluster the policy is non-compliant and provisioning either fails or silently produces objects that do not meet the stated protection level — you believe you have RAID-5 protection when you do not. Check compliance in vCenter after deployment. |
+Set the same annotation on the control plane and every machine deployment, or the pools drift onto
+different images.
 
-### 7.5 `vmClass` — use `guaranteed-*` for production
+### 7.5 Worker pools
 
 ```yaml
-    - name: vmClass
-      value: guaranteed-medium               # ← cluster-wide default (workers)
+    workers:
+      machineDeployments:
+      - class: node-pool
+        metadata:
+          annotations:
+            cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
+            cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
+            run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
+        name: node-pool-1
 ```
 
-The VM class sets each node's CPU and memory shape and — critically — whether those resources are
-**reserved**.
+`class` references a machine-deployment class defined by the ClusterClass, and this entry instantiates
+it. The autoscaler annotations work, because the Cluster Autoscaler is installed by the platform
+([section 3](#3-what-the-platform-already-gives-you)); in some distributions they would be inert.
 
-| Class family | Behaviour | Use for |
-| --- | --- | --- |
-| **`best-effort-*`** | Requests resources with **no reservation**. Under vSphere contention the VM is not guaranteed the CPU and memory it advertises to Kubernetes. | **Dev and test.** Higher consolidation ratio, lower cost, and unpredictable performance is acceptable. |
-| **`guaranteed-*`** | **Reserves** the resources. The VM always has what it claims. | **Production. Recommended.** Also always for the control plane, at any tier. |
+Note the absence of `replicas`. That is correct with an autoscaler-managed pool, since a static value
+and an autoscaler would fight over the same field and oscillate. If you deliberately disable
+autoscaling for a pool you must set `replicas` instead. Choose one model, never both.
 
-> **Why `best-effort` in production fails in a misleading way.** Kubernetes still believes the node
-> has its full allocatable capacity and schedules accordingly, while the hypervisor quietly delivers
-> less. The symptoms — `NotReady` kubelets, etcd leader-election churn, failing liveness probes,
-> random request timeouts — read as "Kubernetes is flaky," sending you to debug the wrong layer
-> entirely. Meanwhile capacity planning based on Kubernetes' view of the cluster is simply wrong.
->
-> This is why the recommendation is unqualified for production: the cost is not slower performance,
-> it is *unpredictable* performance that presents as instability.
+A minimum of 1 means no capacity redundancy: one node failure and everything is unschedulable. Use at
+least 2, ideally 3. Sanity-check the maximum against the pod CIDR arithmetic in
+[7.1](#71-pod-and-service-networking), against vSphere capacity, and against VM-class reservations.
 
-**A default catalogue** (confirm yours with `kubectl get virtualmachineclass`):
-
-| Class | vCPU | Memory | Typical use |
-| --- | --- | --- | --- |
-| `guaranteed-small` | 2 | 4 GiB | Minimal workers |
-| `guaranteed-medium` | 2 | 8 GiB | General-purpose workers |
-| `guaranteed-large` | 4 | 16 GiB | **Control plane**; heavier workers |
-| `guaranteed-xlarge` | 4 | 32 GiB | Memory-intensive workloads |
-| `guaranteed-2xlarge` | 8 | 64 GiB | Large control planes; dense nodes |
-| `guaranteed-4xlarge` | 16 | 128 GiB | High-density nodes |
-
-**Match the class to your `maxPods`.** Raising `maxPods` to 250 ([7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare))
-on a `guaranteed-medium` (2 vCPU / 8 GiB) is not realistic — that is roughly 32 MiB per pod before
-any overhead. If you want dense nodes, use `guaranteed-xlarge` or larger and set
-`resourceConfiguration.systemReserved` so system daemons are not starved.
-
-| Pitfall | Detail |
-| --- | --- |
-| Availability | The class must be associated with your vSphere Namespace: `kubectl get virtualmachineclass`. |
-| Changing it | A `vmClass` change is a **rolling node replacement** — and needs a spare pod CIDR block. |
-| Custom classes | Environments often define their own (e.g. a 20-vCPU/98-GiB class). Custom classes are fine; confirm whether they reserve resources, since the `best-effort`/`guaranteed` naming convention may not apply. |
-
-### 7.6 `volumes` — dedicated containerd and kubelet disks
+Multiple pools are how you separate workloads: different VM classes, different `maxPods`, taints for
+GPU or memory-optimised work. A single undifferentiated pool means every workload shares one node
+shape. Combine extra pools with the per-pool overrides from 7.4:
 
 ```yaml
-    - name: volumes
-      value:
-      - capacity: 30Gi
-        mountPath: /var/lib/containerd        # ← container image layers
-        name: containerd
-        storageClass: <STORAGE_CLASS>
-      - capacity: 30Gi
-        mountPath: /var/lib/kubelet           # ← ephemeral pod storage, emptyDir, logs
-        name: kubelet
-        storageClass: <STORAGE_CLASS>
+      - class: node-pool
+        name: node-pool-memory
+        variables:
+          overrides:
+          - name: vmClass
+            value: guaranteed-2xlarge
+          - name: node
+            value:
+              labels:
+                workload-type: memory-optimised
 ```
 
-**This is a genuine best practice and one of the strongest parts of the sample. Keep it.**
-
-By default both directories live on the node's root disk. `/var/lib/containerd` holds every
-container image layer pulled onto the node; `/var/lib/kubelet` holds ephemeral pod storage,
-`emptyDir` volumes, and pod logs. Both grow in ways you do not directly control.
-
-On a shared root disk, one image-pull storm or a single log-happy pod can fill the root filesystem.
-When that happens the **kubelet itself degrades** — evicting pods under disk pressure and, if the
-disk fills, ceasing to function. One misbehaving workload takes out the whole node.
-
-Dedicated volumes contain that failure. A full containerd volume means image pulls fail: bad, but
-survivable and diagnosable. A full root disk means the node is gone.
-
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `capacity: 30Gi` | Sized for a modest workload set. | **30Gi is modest.** Image-heavy workloads — AI/ML frameworks, large JVM or data-science images, CUDA layers — exhaust a 30Gi containerd volume quickly, and multiple image versions accumulate. `/var/lib/kubelet` fills fast with `emptyDir`-heavy workloads. **Denser nodes need proportionally more:** a node running 250 pods needs far more ephemeral space and image cache than one running 110. |
-| `mountPath` | The two highest-growth, least-predictable directories on a node. | Both paths must be exactly as the kubelet and containerd expect. Do not improvise alternatives. |
-| `storageClass` | Must be associated with your vSphere Namespace. | The same class name appears here twice and in two other variables — keep all occurrences consistent. |
-| **Changing later** | — | **Adding or resizing a volume is a rolling node-replacement operation**, not an in-place change. Every node in the pool is destroyed and rebuilt — survivable with a healthy multi-node pool and PodDisruptionBudgets, but disruptive, slow, needing a spare pod CIDR block, and with `controlPlane.replicas: 1` an outage. **This is the strongest argument for sizing generously on day one.** |
-
-### 7.7 `kubernetes` — certificates, etcd, security, and API server
-
-The densest and most consequential variable in the manifest.
+### 7.6 Pod Security
 
 ```yaml
-    - name: kubernetes
-      value:
-        certificateRotation:
-          enabled: true                    # ← keep this on
-          renewalDaysBeforeExpiry: 90
-        etcdConfiguration:
-          maximumDBSizeGiB: 4
         security:
           podSecurityStandard:
-            audit: privileged              # ← dev/test reference values
-            auditVersion: latest
-            deactivated: false
             enforce: privileged
             enforceVersion: latest
+            audit: privileged
+            auditVersion: latest
             warn: privileged
             warnVersion: latest
-          resourceQuotaConfiguration:
-            enabled: true
-        apiServerConfiguration:
-          logs:
-            format: json
-          extraAuthentication:
-            jwt:
-            - issuer:
-                url: https://idp.example.com
-                audiences:
-                - <OIDC_CLIENT_ID>         # ← ≡ Headlamp's clientID
-              claimMappings:
-                username:
-                  claim: email
-                  prefix: "oidc:"          # ← mandatory anti-impersonation guard
-                groups:
-                  claim: groups
-                  prefix: "oidc-groups:"
-              claimValidationRules:
-              - expression: 'claims.?email_verified.orValue(true) == true'   # ← FAILS OPEN
-                message: "email must be verified"
-        kubeletConfiguration:
-          logging:
-            format: json
+            deactivated: false
 ```
 
-#### 7.7.1 `certificateRotation`
+These are lab settings. `privileged` at all three levels means Pod Security enforces nothing, which is
+right for exploring a platform without admission control rejecting workloads. It is not required by anything
+else in the profile; see [the Istio note](#on-istio-cni-and-pod-security).
 
-| Field | Why | Pitfall |
+Three levels, weakest to strongest: `privileged` permits everything; `baseline` blocks known privilege
+escalations while staying broadly compatible; `restricted` enforces hardening, requiring non-root, no
+privilege escalation, dropped capabilities, and a seccomp profile. Three modes: `enforce` rejects at
+admission and is the only one that blocks anything, while `audit` records violations and `warn`
+returns a warning to the client.
+
+`*Version: latest` is a genuine upgrade hazard. It means whatever the running Kubernetes version
+defines, and PSS definitions tighten over time as escape vectors close. So a cluster upgrade can
+silently make your admission policy stricter and reject workloads that deployed cleanly the day
+before, during an upgrade, when you are already busy. Pin an explicit version and raise it as a
+separate, tested change.
+
+There is also an option worth taking that costs nothing. Setting `enforce: privileged` while raising `audit`
+and `warn` to `restricted` gives you a complete inventory of exactly which workloads would break under
+stricter enforcement, without rejecting anything. It is the standard way to plan a PSS migration and
+it costs nothing. Do it today.
+
+#### Two levers, and when to use each
+
+Once you enforce anything above `privileged`, you need an approach for namespaces that legitimately
+need more. There are two mechanisms, they behave differently, and picking the wrong one is the most common
+Pod Security mistake after leaving it at `privileged`.
+
+| | Per-namespace labels | `exemptions.namespaces` |
 | --- | --- | --- |
-| `enabled: true` | **Correct — keep it.** Control-plane certificates expire, and expired certificates mean a dead control plane you cannot fix through the API, because the API is what stopped working. Automating renewal removes an entire class of self-inflicted outage that has taken down clusters run by competent teams. | The only real failure mode of manual rotation is forgetting. Automation is strictly better. |
-| `renewalDaysBeforeExpiry: 90` | Renews 90 days ahead, a wide window for rotation to happen and be noticed. | Must be comfortably shorter than certificate validity, and long enough that renewal lands inside a maintenance window rather than at the expiry cliff. 90 days on a one-year certificate is sensible. |
-| Verification | — | Rotation is silent when it works, which makes it an untested assumption. Confirm at least once — see [Day-2](#12-day-2-lifecycle). |
+| Lives on | The `Namespace` object | The `Cluster` manifest, in the API server admission config |
+| Effect | Applies a different level to that namespace | Bypasses Pod Security entirely |
+| Granularity | Per level and per mode | All or nothing: no enforce, audit, or warn |
+| Controlled by | Whoever can label namespaces | Platform team only |
+| Cost to change | A label edit | A `Cluster` edit and a control-plane reconfiguration |
+| Keeps audit trail | Yes, violations still logged | No |
 
-#### 7.7.2 `etcdConfiguration`
+Prefer labels. An exemption does not grant a lower level, it turns the policy off, and you lose
+`audit` and `warn` visibility with it. A label keeps the policy engaged at a level the workload can
+actually meet:
 
 ```yaml
-        etcdConfiguration:
-          maximumDBSizeGiB: 4
-          # also available: maxRequestSizeKiB
-```
-
-| Consideration | Detail |
-| --- | --- |
-| Why size it explicitly | etcd stores every object plus revision history until compaction. **An addon stack of this size is exactly the workload that grows etcd** — five addons bring many CRDs, and operators are chatty: the Prometheus operator, cert-manager, and kapp-controller all write status and events continuously. |
-| **The read-only alarm** | Exceeding the quota raises a `NOSPACE` alarm and puts etcd **read-only**. Every write fails. It presents as a total cluster outage and **does not clear on its own** — you must compact, defragment, and explicitly disarm the alarm, all requiring etcd-level access at the moment your control plane appears dead. |
-| Prerequisite | The **etcd volume must actually have the space.** Setting a quota larger than the disk converts a clean quota stop into a disk-full condition, which is worse. |
-| **Recommendation** | **Monitor etcd database size and alert at 60–70% of the quota.** You have Prometheus in this stack; use it. That converts an outage into a ticket. Also confirm auto-compaction is running. |
-| `maxRequestSizeKiB` | Also available in 3.7. Raise only if you have genuinely large objects — large CRDs or ConfigMaps. Raising it lets clients push more per request, which grows etcd faster. |
-| Sizing | 4 GiB is reasonable for a small-to-medium cluster with this addon set. High object counts, heavy CRD use, or high event churn need more. Check the schema default rather than assuming 4 is a change. |
-
-#### 7.7.3 `security.podSecurityStandard`
-
-> **These values are dev/test reference settings.** `privileged` at all three levels means Pod
-> Security enforces nothing — which is exactly right for a lab where you want to explore the
-> platform without admission control getting in the way. **It is not a production recommendation**,
-> and it is **not** required by anything else in this manifest (see the
-> [Istio CNI note](#a-note-on-istiocni-and-pod-security) — with no sidecar injection, Istio imposes
-> no Pod Security constraint here).
-
-Three levels, weakest to strongest:
-
-| Level | Meaning | Appropriate for |
-| --- | --- | --- |
-| `privileged` | **No restrictions.** Any pod may request host namespaces, privileged containers, arbitrary capabilities, host paths. | Dev/test, or a lab |
-| `baseline` | Blocks known privilege escalations while staying broadly compatible with common workloads. | **A realistic production floor** |
-| `restricted` | Enforces hardening: non-root, no privilege escalation, dropped capabilities, seccomp. | **The production target** |
-
-Three modes:
-
-| Mode | Effect |
-| --- | --- |
-| `enforce` | **Rejects** non-compliant pods at admission. The only mode with teeth. |
-| `audit` | Records violations in the audit log. Pod is admitted. |
-| `warn` | Returns a warning to the user's client. Pod is admitted. |
-
-| Field | Sample value | Assessment |
-| --- | --- | --- |
-| `enforce` | `privileged` | Nothing is blocked. For production, `baseline` minimum, `restricted` as the target. |
-| `audit` / `warn` | `privileged` | **A free win being left on the table.** Setting `enforce: privileged` while raising `audit` and `warn` to `restricted` gives you **a complete, zero-risk inventory of exactly which workloads would break under stricter enforcement** — nothing is rejected, but every violation is logged and surfaced to users. This is the standard way to plan a PSS migration and it costs nothing. **Do this today.** |
-| `deactivated: false` | Correct | The machinery is active; only the level is permissive. |
-| `*Version: latest` | Unpinned | **A real upgrade hazard.** `latest` means "whatever this Kubernetes version defines," and PSS definitions tighten over time as new escape vectors close. A cluster upgrade can silently make your admission policy stricter, rejecting workloads that deployed cleanly yesterday — during an upgrade, when you are already busy. **Pin explicitly** (e.g. `v1.36`), then raise deliberately as a separate, tested change. |
-
-##### Namespace strategy: two levers, and when to use each
-
-Once PSS enforces anything above `privileged`, you need a story for namespaces that legitimately
-need more privilege than the cluster default. There are **two** mechanisms, they behave very
-differently, and choosing the wrong one is the most common Pod Security mistake after leaving it at
-`privileged`.
-
-| | **Per-namespace labels** | **`exemptions.namespaces`** |
-| --- | --- | --- |
-| Where it lives | Labels on the `Namespace` object | The `Cluster` manifest (API server admission config) |
-| What it does | Applies a **different level** to that namespace | **Bypasses PSS entirely** for that namespace |
-| Granularity | Per level and per mode — grant `baseline` where the default is `restricted` | All-or-nothing; no enforce, audit, *or* warn |
-| Visibility | Visible to anyone who can read the namespace | Visible only to whoever reads the `Cluster` manifest |
-| Who controls it | Whoever can label namespaces | Platform team only |
-| Cost to change | A label edit | A `Cluster` edit + control-plane reconfiguration |
-| Audit trail retained? | **Yes** — violations still logged and warned | **No** — you lose all signal from that namespace |
-
-**Prefer labels.** An exemption is a blunt instrument: it does not grant a lower level, it turns the
-policy off, and you lose `audit`/`warn` visibility along with it. A namespace label keeps the policy
-engaged at a level that workload can actually meet.
-
-```yaml
-# The standard pattern: grant `baseline` in a namespace whose cluster default is `restricted`.
+# Apply in the workload cluster context, not the vSphere Namespace.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -1736,16 +1356,16 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: v1.36
-    # Keep audit/warn STRICTER than enforce — you still get told what would
-    # fail under restricted, without blocking the workload today.
+    # keep audit and warn stricter than enforce, so you still learn what
+    # would fail under restricted without blocking the workload today
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/audit-version: v1.36
     pod-security.kubernetes.io/warn: restricted
     pod-security.kubernetes.io/warn-version: v1.36
 ```
 
-Reserve `exemptions.namespaces` for **platform and infrastructure namespaces** that cannot run under
-any enforced level — a short, stable list the platform team owns:
+Reserve exemptions for platform namespaces that cannot run under any enforced level: a short, stable
+list the platform team owns.
 
 ```yaml
           podSecurityStandard:
@@ -1761,101 +1381,234 @@ any enforced level — a short, stable list the platform team owns:
               - vmware-system-antrea        # CNI agent
 ```
 
-##### The seamless-install problem
+#### Making Helm charts install without friction
 
-Here is the friction in practice. `helm install --create-namespace` creates a **bare** namespace with
-no PSA labels, so it inherits the cluster default. If the chart's pods cannot meet that level, they
-are rejected — and the operator has to go back, create the namespace by hand with labels, and
-reinstall. The same applies to any CI pipeline or `kubectl apply -f` that assumes it can create its
-own namespace.
+Here is the practical problem. `helm install --create-namespace` creates a bare namespace with no PSA
+labels, so it inherits the cluster default. If the chart's pods cannot meet that level they are
+rejected, and the operator has to go back, create the namespace by hand with labels, and reinstall.
+Same for any CI pipeline that assumes it can create its own namespace.
 
-**The most useful thing to know: most of this friction lives at `restricted`, not `baseline`.**
+The most useful thing to know is that most of this friction lives at `restricted`, not `baseline`.
+`baseline` blocks host namespaces, privileged containers, and dangerous capabilities, which most
+application charts never request; charts that break there are usually infrastructure components you
+were going to treat specially anyway. `restricted` additionally demands `runAsNonRoot`,
+`allowPrivilegeEscalation: false`, a `seccompProfile`, and all capabilities dropped, and plenty of
+ordinary charts simply do not set those in their pod specs.
 
-| Cluster default | What typically breaks |
-| --- | --- |
-| `privileged` | Nothing. No policy. |
-| **`baseline`** | Little. `baseline` blocks host namespaces, privileged containers, and dangerous capabilities — things most application charts never request. Charts that break here are usually infrastructure components, which you were going to treat specially anyway. |
-| `restricted` | **A great deal.** It additionally requires `runAsNonRoot`, `allowPrivilegeEscalation: false`, a `seccompProfile`, and all capabilities dropped. Many perfectly ordinary charts do not set these in their pod specs, so they fail even though they need no real privilege. |
+So `enforce: baseline` provides most of the security benefit with little disruption, and it is the pragmatic
+cluster default for a platform serving charts you do not control. Treat `restricted` as a per-namespace
+goal you raise deliberately.
 
-**So `enforce: baseline` is the setting that buys most of the security with little of the pain**, and
-it is the pragmatic cluster default for a platform serving charts you do not control. Treat
-`restricted` as a per-namespace goal you raise deliberately, not a cluster-wide starting point.
+For namespace creation itself, four options:
 
-##### Four ways to handle namespace creation
+| Approach | Seamless install | Assessment |
+| --- | --- | --- |
+| Platform pre-creates namespaces with PSA labels; teams install into an existing namespace | No, one extra step | The recommended default. Fine-grained, self-documenting, no control-plane changes, and namespace creation becomes a reviewable action, which is usually what you want. |
+| The `Namespace` object is committed alongside the release in Git, labels included | Yes | Best if you already do GitOps. You have helm-controller, so a labelled `Namespace` can sit next to the `HelmRelease` and apply together. Seamless, fine-grained, and auditable. |
+| Pre-declare namespace names in `exemptions.namespaces` before they exist | Yes | A narrow escape hatch. It works because the exemption is a name match evaluated at admission, so the name can be listed before the namespace exists. But it disables Pod Security for those names, does not scale past a handful, and needs a control-plane change each time. |
+| Keep the cluster default at `privileged` and label individual namespaces stricter | Yes | Not recommended. It inverts the posture, so every namespace anyone forgets is unprotected, and the failure is silent. Acceptable only as a transitional state. |
 
-| # | Approach | Seamless install? | Assessment |
-| --- | --- | --- | --- |
-| **A** | **Platform pre-creates namespaces with PSA labels.** App teams install into an existing namespace, without `--create-namespace`. | No — one extra step | **The recommended default.** Fine-grained, self-documenting, standard upstream practice, no control-plane changes. Namespace creation becomes a deliberate, reviewable platform action, which is usually what you want anyway. |
-| **B** | **Namespace committed alongside the release in Git**, labels included. | Yes | **Best if you already do GitOps.** You have the `helm-controller` addon ([6.1](#61-helm-controller)), so a `Namespace` object with PSA labels can sit next to the `HelmRelease` in the same directory and be applied together. Seamless *and* fine-grained *and* auditable. |
-| **C** | **Pre-declare namespace names in `exemptions.namespaces`** before they exist. | Yes | A narrow escape hatch. Works because the exemption is a **name match evaluated at admission**, so the name can be listed before the namespace is created — but it fully disables PSS for those names, does not scale past a handful, and needs a control-plane change each time. Use only where you must support `--create-namespace` unchanged for a known, fixed set of namespaces. |
-| **D** | **Keep the cluster default at `privileged`, label individual namespaces stricter.** | Yes | **Not recommended.** It inverts the posture: every namespace anyone forgets is unprotected, and the failure is silent. Acceptable only as a transitional state while you inventory workloads. |
+One caveat to plan for: if application teams can label their own namespaces, they can grant themselves
+`privileged`. Per-namespace labels are only as strong as the RBAC around namespace creation. The simple
+control is not granting namespace `create` or `patch` to application teams, which the first approach
+above does naturally. If teams must self-serve namespaces, restricting which PSA label values they can
+set needs a policy engine such as `gatekeeper`.
 
-**A recommended combination:** cluster default `enforce: baseline` with `audit`/`warn: restricted`;
-approach **A** or **B** for workload namespaces; `exemptions.namespaces` reserved for platform
-components. That gives seamless installs for the common case, real enforcement everywhere, full
-visibility into what stands between you and `restricted`, and a short exemption list you can defend
-in a review.
-
-##### One caveat worth planning for
-
-**If app teams can label their own namespaces, they can grant themselves `privileged`.** Per-namespace
-labels are only as strong as the RBAC around namespace creation and modification. Two mitigations:
-
-- **Do not grant namespace `create`/`patch` to app teams.** The platform creates namespaces
-  (approach A), which is the simplest and most robust control.
-- If teams must self-serve namespaces, restrict which PSA label values they can set. That needs a
-  policy engine — `gatekeeper` is in the catalogue ([6.6](#66-additional-addons-worth-considering))
-  if you go that route.
-
-##### Finding out what would break, before it does
-
-`audit` and `warn` set stricter than `enforce` is the whole point — it tells you the answer without
-blocking anything:
+To find out what would break before it does, `audit` and `warn` set stricter than `enforce` is the
+whole point:
 
 ```bash
-# `warn` violations come back to the client on apply — the fastest signal
-kubectl apply -f my-chart-output.yaml
-# Warning: would violate PodSecurity "restricted:v1.36": allowPrivilegeEscalation != false ...
-
-# Dry-run a rendered chart against the live admission chain without creating anything
+# Workload cluster context.
+# warn violations come back to the client on apply
 helm template my-release ./chart --namespace my-ns | kubectl apply --dry-run=server -f -
 
-# What level is each namespace actually at right now?
+# what level is each namespace actually at
 kubectl get ns -L pod-security.kubernetes.io/enforce,pod-security.kubernetes.io/enforce-version
 ```
 
-`audit` violations land in the API server audit log, which is the durable record — another reason to
-ship those logs somewhere ([Appendix D.2](#d2-log-forwarding-fluent-bit)).
+`audit` violations land in the API server audit log, which is the durable record and another reason to
+ship those logs somewhere.
 
-##### The migration path, in order
+#### A migration order
 
-1. **Today, risk-free:** set `audit` and `warn` to `restricted`, leave `enforce: privileged`. Change
-   nothing else. Collect violations across a full workload cycle, including scheduled jobs.
+1. Today, at no risk: set `audit` and `warn` to `restricted`, leave `enforce: privileged`, change
+   nothing else. Collect violations across a full workload cycle including scheduled jobs.
 2. Pin all three versions explicitly.
-3. Move `enforce` to **`baseline`** — the step with the best security-to-friction ratio.
-4. Decide namespace creation policy (approach **A** or **B** above) and label existing workload
-   namespaces explicitly rather than relying on the cluster default.
-5. Add `exemptions.namespaces` for the platform components that genuinely cannot run enforced.
-6. Raise individual workload namespaces to `restricted` as their charts are fixed — per namespace,
-   not cluster-wide.
+3. Move `enforce` to `baseline`. Best security-to-friction ratio of any step here.
+4. Decide your namespace creation policy and label existing workload namespaces explicitly rather than
+   relying on the cluster default.
+5. Add `exemptions.namespaces` for platform components that genuinely cannot run enforced.
+6. Raise individual workload namespaces to `restricted` as their charts are fixed.
 7. Once nothing depends on the looser default, raise the cluster default to `restricted`.
-8. **If you later adopt the Istio sidecar mesh**, enable `istioCNI` at the same time — otherwise
-   injected pods need `privileged` and undo this work.
 
-#### 7.7.4 `security.resourceQuotaConfiguration`
+If you adopt the Istio sidecar mesh at any point, enable `istioCNI` in the same change or injected pods
+will need `privileged` and undo the work.
+
+#### Resource quotas
 
 ```yaml
           resourceQuotaConfiguration:
             enabled: true       # schema default is false
 ```
 
-| Consideration | Detail |
-| --- | --- |
-| Why enable it | Without quotas, one namespace can consume all cluster capacity and starve everything else. A basic multi-tenancy and cost-control guardrail. |
-| **Pitfall** | Enabling quota enforcement can cause **previously schedulable workloads to be rejected**, because pods without resource requests may not be admitted once a quota applies. Turn it on in non-production first and ensure workloads declare requests and limits. |
-| Note | The schema default is `false`, so `true` here is a deliberate choice — a good one. Exact behaviour is release-specific; see [Appendix C](#appendix-c--verify-for-your-environment). |
+Without quotas one namespace can consume all cluster capacity and starve everything else, so this is a
+basic multi-tenancy guardrail and enabling it is a deliberate improvement over the default. The catch
+is that enabling quota enforcement can cause previously schedulable workloads to be rejected, because
+pods without resource requests may no longer be admitted. Turn it on in non-production first and make
+sure workloads declare requests and limits.
 
-#### 7.7.5 Structured logging
+### 7.7 Identity: OIDC and RBAC
+
+This configures structured authentication on the API server, so JWTs from an external identity
+provider are accepted as Kubernetes credentials and humans authenticate with corporate identity rather
+than long-lived kubeconfig certificates. Central revocation, MFA, and short-lived credentials come
+with it.
+
+The mechanism is generic OIDC. Any compliant provider works: Entra ID, Okta, Keycloak, Dex, Ping,
+Auth0, Google, GitLab, or something self-hosted. The fields are the same in every case. Where providers
+differ is in which claims they emit, and that is the one thing you have to check against your own
+tokens.
+
+In this profile it exists to support Headlamp login, since the UI obtains ID tokens the API server has
+to accept. It is equally useful for `kubectl` with an OIDC-aware credential plugin.
+
+```yaml
+        apiServerConfiguration:
+          extraAuthentication:
+            jwt:
+            - issuer:
+                url: https://idp.example.com
+                audiences:
+                - <OIDC_CLIENT_ID>
+              claimMappings:
+                username:
+                  claim: email
+                  prefix: "oidc:"
+                groups:
+                  claim: groups
+                  prefix: "oidc-groups:"
+              claimValidationRules:
+              - expression: 'claims.?email_verified.orValue(false) == true'
+                message: "email must be verified"
+```
+
+| Field | Comment |
+| --- | --- |
+| `issuer.url` | Must match the token's `iss` claim exactly, trailing slash included, and match what your client uses. The API server must also be able to reach the URL and its JWKS endpoint; in a restricted-egress environment external OIDC simply does not work, and the failure looks like universally invalid tokens. |
+| `audiences` | A token is accepted only if its `aud` claim is listed, which is what stops a token minted for another application being replayed here. Must contain the client ID your UI or CLI uses. |
+| `claimMappings.username.claim` | Which claim becomes the Kubernetes username. `email` is stable and readable and matches how people think about identity. Requires the corresponding scope. Note that email is not immutable at every provider, so if an address changes the Kubernetes identity changes and the RBAC bindings stop applying. An immutable subject identifier is more robust at the cost of unreadable RBAC. |
+| `claimMappings.username.prefix` | A security control, not decoration. The prefix namespaces external identities so they cannot collide with, and therefore cannot impersonate, built-in subjects like `system:masters` members or ServiceAccounts. Without it, a provider that lets a user set an arbitrary email could mint an identity RBAC already trusts. Never leave it empty, and note that changing it orphans every existing binding at once. |
+| `claimMappings.groups.claim` | Enables group-based RBAC, which is the only approach that scales. Verify your provider actually emits this claim: many do not by default, some need a specific scope, some need it added to the token explicitly, some need a directory-API integration or a broker. If the claim is absent, group bindings silently do nothing, and you find out after designing your RBAC around them. Inspect a real token first. |
+| `claimMappings.groups.prefix` | Same reasoning, more urgently. Without it, a provider group literally named `system:masters` would grant cluster-admin. |
+| `claimValidationRules` | Additional trust conditions, in two forms: `claim` with `requiredValue` for a simple equality check, or `expression` for CEL. |
+
+Fields the profile does not use but enterprise deployments often need:
+
+| Field | When |
+| --- | --- |
+| `issuer.certificateAuthority` | Essential for an internal provider. Supplies the CA bundle the API server uses to trust the issuer's TLS certificate. Without it, a provider behind an enterprise or self-signed CA is unreachable and every token fails validation. |
+| `issuer.egressSelectorType` | `controlplane` or `cluster`, selecting the network path the API server uses to reach the provider. Matters when it is reachable from only one. |
+| `issuer.discoveryURL` | When discovery metadata is not at the standard path relative to the issuer URL. |
+| `issuer.audienceMatchPolicy` | `MatchAny`, to accept a token matching any listed audience. |
+| `claimMappings.uid`, `claimMappings.extra` | Map claims to the user UID or to extra attributes, for audit correlation or authorization webhooks. |
+| `userValidationRules` | CEL rules validating the mapped user rather than the raw claims, for example asserting the username carries the expected prefix. Useful defence in depth. |
+
+#### Writing claim validation rules
+
+```
+claims.?email_verified.orValue(false) == true
+```
+
+Read it piece by piece. `claims.?email_verified` is CEL optional chaining: it yields the claim's value
+if present, or an empty optional if absent, and the `?` is what stops a missing claim erroring.
+`.orValue(false)` unwraps the optional and supplies `false` when the claim is absent. Then `== true`
+compares.
+
+The substituted value is the part to think about. It decides what happens to a token that omits the
+claim, and `false` is what you want, because a token you cannot evaluate is rejected rather than
+admitted. Since the Kubernetes username is derived from the email claim here, a provider or client
+that omits `email_verified` should not be able to present an unverified address as an identity.
+
+Apply the same reasoning to every CEL rule you write. Choose the substituted value so that a missing
+claim denies access, and make the `message` describe the condition the rule actually enforces so the
+error is useful to whoever hits it.
+
+#### Authentication is not authorization
+
+A successfully authenticated user has no permissions until an RBAC binding names them, and the
+affected users report a broken cluster rather than a missing binding. This happens often enough to be
+worth stating plainly.
+
+The subject name is the prefix concatenated with the mapped claim value. With `prefix: "oidc:"` and
+`claim: email`, a user whose email is `user@example.com` is the Kubernetes user `oidc:user@example.com`.
+Bindings are applied inside the workload cluster, not the vSphere Namespace.
+
+Always verify the exact string the API server derives rather than assuming:
+
+```bash
+# Workload cluster context.
+kubectl auth whoami
+kubectl auth can-i --list
+```
+
+[Appendix B.1](#b1-rbac-for-oidc-identities) has the bindings, including group-based ones and the
+least-privilege pattern.
+
+### 7.8 Platform settings
+
+The remaining `kubernetes` sub-variables and cluster-level settings, grouped by what they affect.
+
+#### Certificates
+
+```yaml
+        certificateRotation:
+          enabled: true
+          renewalDaysBeforeExpiry: 90
+```
+
+Keep this on. Control-plane certificates expire, and expired certificates mean a dead control plane you
+cannot fix through the API, because the API is what stopped working. Automating renewal removes a class
+of self-inflicted outage that has taken down clusters run by competent teams. The only real failure mode
+of manual rotation is forgetting.
+
+The window must be comfortably shorter than certificate validity, and long enough that renewal lands
+inside a maintenance window rather than at the expiry cliff. 90 days on a one-year certificate is
+sensible.
+
+Rotation is silent when it works, which makes it an untested assumption. Confirm once that it has
+actually happened, then alert on certificate expiry as a backstop so a silently broken rotation surfaces
+months before it becomes an outage.
+
+#### etcd
+
+```yaml
+        etcdConfiguration:
+          maximumDBSizeGiB: 4
+```
+
+etcd stores every object plus revision history until compaction, and an addon stack of this size is
+exactly the workload that grows it: five addons bring many CRDs, and operators write frequently, with the
+Prometheus operator, cert-manager, and kapp-controller all writing status and events continuously.
+
+Exceeding the quota raises a `NOSPACE` alarm and puts etcd read-only. Every write fails. It presents as
+a total cluster outage and does not clear on its own; you must compact, defragment, and explicitly
+disarm the alarm, all needing etcd-level access at the moment your control plane appears dead.
+
+Two things follow. The etcd volume must actually have the space, since a quota larger than the disk
+converts a clean stop into a disk-full condition. And you should alert on database size at 60 to 70% of
+the quota, which turns an outage into a ticket. Watch the trend rather than just the threshold: steady
+growth usually means excessive object churn, a controller writing status in a loop, or auto-compaction
+not running.
+
+4 GiB suits a small-to-medium cluster with this addon set. High object counts, heavy CRD use, or high
+event churn need more. `maxRequestSizeKiB` is also available; raise it only for genuinely large objects,
+remembering that it lets clients push more per request and so grows etcd faster.
+
+Related: `kubeControllerManagerConfiguration.terminatedPodGCThreshold` sets how many terminated pods are
+retained before garbage collection. Lowering it helps on high-churn clusters, since retained pod objects
+consume etcd space.
+
+#### Logging
 
 ```yaml
         apiServerConfiguration:
@@ -1866,193 +1619,125 @@ ship those logs somewhere ([Appendix D.2](#d2-log-forwarding-fluent-bit)).
             format: json
 ```
 
-| Consideration | Detail |
+Structured JSON is parsed reliably by log aggregators with no fragile regex extraction, and fields
+become queryable. Setting it on both the API server and the kubelet is right; mixed formats in one
+pipeline defeat the purpose.
+
+This only pays off if the logs leave the node, because node logs are lost when a node is replaced, which
+happens on every upgrade. If you do not already forward logs, see
+[Appendix C.2](#c2-log-forwarding-fluent-bit).
+
+Human readability drops noticeably, so keep a JSON formatter available and remember that if your
+pipeline is down you are reading JSON directly. Structured lines are also more verbose, so account for the volume.
+
+`logs.verbosity` is available; leave it at the default unless debugging, since high verbosity on a busy
+API server generates enormous volume.
+
+#### Other kubelet settings worth knowing
+
+| Field | Comment |
 | --- | --- |
-| Why | Structured JSON is parsed reliably by log aggregators with no fragile regex extraction, and fields become queryable. For any cluster shipping logs off-node — which should be every production cluster — this is right. |
-| Consistency | Setting it on **both** API server and kubelet is good practice; mixed formats in one pipeline defeat the purpose. |
-| **Pair it with log shipping** | This decision only pays off if the logs leave the node — node logs are lost when a node is replaced, which happens on every upgrade. If you do not already forward logs, see [Appendix D.2](#d2-log-forwarding-fluent-bit). |
-| Pitfalls | Human readability drops noticeably — keep `jq` handy, and remember that if your pipeline is down you are reading JSON by hand. Structured lines are also more verbose; account for the volume. |
-| Also available | `logs.verbosity` (0–10) and `logs.flushFrequency`. Leave verbosity at its default unless debugging; high verbosity on a busy API server generates enormous volume. |
+| `podPidsLimit` | Caps PIDs per pod. Worthwhile defence against fork-bomb resource exhaustion. |
+| `containerLogMaxSizeMiB`, `containerLogMaxFiles` | Bound per-container log growth, which protects the `/var/lib/kubelet` volume from a pod writing large log volumes. |
+| `imageGCHighThresholdPercent`, `imageGCLowThresholdPercent` | Disk-usage thresholds for image garbage collection. Tune together with the containerd volume size. |
+| `serializeImagePulls`, `maxParallelImagePulls` | Image-pull concurrency. Parallel pulls speed up scale-out and can saturate the registry or network. |
+| `imagePullCredentialsVerificationPolicy` | `AlwaysVerify` prevents a pod using an image another tenant cached on the node without presenting its own credentials. A real multi-tenancy control in shared clusters. |
+| `allowedUnsafeSysctls` | Specialised tuning only. Taint such pools and schedule only workloads that need them. |
 
-#### 7.7.6 `apiServerConfiguration.extraAuthentication` — OIDC
+#### API server tuning and TLS
 
-This configures **structured authentication**: JWTs from an external identity provider are accepted
-as Kubernetes credentials, so humans authenticate with corporate identity instead of long-lived
-kubeconfig certificates. Central revocation, MFA, and short-lived credentials come with it — a
-significant security improvement.
+`maxRequestsInFlight` and `maxMutatingRequestsInFlight` are concurrency limits; raise them for very
+large or controller-heavy clusters, since the defaults suit most. `requestTimeout` bounds
+non-long-running requests. `profiling` exposes `/debug/pprof`; it can be disabled, but support tooling
+uses those endpoints, so leave it at the default unless a specific policy says otherwise.
 
-> **The provider in the sample is an example, not a requirement.** This mechanism is **generic
-> OIDC**. Any compliant provider works — Entra ID, Okta, Keycloak, Dex, Ping, Auth0, Google, GitLab,
-> or a self-hosted issuer. Nothing below is provider-specific, and the fields you need are the same
-> in every case. Where providers differ is in *which claims they emit*, which is the one thing you
-> must check against your own IdP's token.
->
-> **This configuration exists to support OIDC login for Headlamp** ([6.5](#65-headlamp)) — the UI
-> obtains ID tokens and the API server must accept them. It is equally useful for `kubectl` access
-> with an OIDC-aware credential plugin.
+`security.minimumTLSProtocol` and `security.tlsCipherSuites` are available and deserve caution rather
+than enthusiasm. Raising the TLS floor or narrowing ciphers breaks any client, controller, webhook, or
+integration that has not been validated against it, and the failures are handshake errors scattered
+across unrelated components that do not name cipher negotiation as the cause. Change them only against
+a specific compliance requirement, with a tested inventory of everything that talks to the API server.
 
-##### OIDC field reference
+`kubeProxyConfiguration.enabled` allows disabling kube-proxy for CNIs that replace it, such as some
+Cilium modes. Do not disable it unless your CNI explicitly requires it; service networking stops
+working otherwise.
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `issuer.url` | The trusted issuer. The API server fetches OIDC discovery metadata and signing keys from here. | **Must match the token's `iss` claim exactly**, trailing slash included, and match the value your client uses. The API server must also be able to **reach** this URL and its JWKS endpoint — in a restricted-egress environment external OIDC simply does not work, and the failure looks like universally invalid tokens. See `egressSelectorType` below. |
-| `audiences` | A token is accepted only if its `aud` claim is in this list. This is what stops a token minted for another application being replayed against your cluster. | **Must contain the client ID your UI or CLI uses.** If it does not, users authenticate successfully at the IdP and then every API call fails — a symptom that points nowhere near the cause. |
-| `claimMappings.username.claim` | Which claim becomes the Kubernetes username. `email` is stable, human-readable, and matches how people think about identity. | Requires the corresponding scope to be requested by the client. Note `email` is not immutable at every IdP — if a user's address changes, their Kubernetes identity changes and their RBAC bindings stop applying. Where available, an immutable subject identifier (`sub`) is more robust at the cost of unreadable RBAC. |
-| `claimMappings.username.prefix` | **A mandatory security control.** The prefix namespaces external identities so they cannot collide with — and therefore cannot impersonate — built-in Kubernetes subjects such as `system:masters` members or ServiceAccounts (`system:serviceaccount:...`). Without it, an IdP that lets a user set an arbitrary email could mint an identity RBAC already trusts. | **Never leave it empty.** And note that **changing it orphans every existing RBAC binding at once** — the username string changes, bindings naming the old form stop matching, and every user loses access simultaneously. Choose it once. |
-| `claimMappings.groups.claim` | Maps an IdP group claim to Kubernetes groups, enabling group-based RBAC — the only approach that scales. | **Verify your IdP actually emits this claim.** Many do not by default: some require a specific scope, some need the claim explicitly added to the token, and some require a directory-API integration or a broker (Dex, Keycloak) to enrich tokens. If the claim is absent, group bindings silently do nothing — and you discover it only after designing your RBAC around them. **Inspect a real token before relying on groups.** |
-| `claimMappings.groups.prefix` | Same anti-impersonation reasoning, and more urgent here: without it, an IdP group literally named `system:masters` would grant cluster-admin outright. | Not optional. |
-| `claimValidationRules` | Additional trust conditions. Two forms: `claim` + `requiredValue` for a simple equality check, or `expression` for CEL. | The sample's rule **fails open** — see below. |
-| `message` | The error returned on rejection. | Make it describe what actually happened. A message claiming email verification is required, on a rule that does not require it, is worse than no message — it stops you looking. |
-
-##### Fields not in the sample that matter for enterprise IdPs
-
-Verify availability against your ClusterClass schema:
-
-| Field | When you need it |
-| --- | --- |
-| `issuer.certificateAuthority` | **Essential for an internal or private IdP.** Supplies the CA bundle the API server uses to trust the issuer's TLS certificate. Without it, an IdP behind an enterprise CA or a self-signed certificate is unreachable and every token fails validation. |
-| `issuer.egressSelectorType` | `controlplane` or `cluster` — selects the network path the API server uses to reach the IdP. Important when the IdP is only reachable from one of them. |
-| `issuer.discoveryURL` | When discovery metadata is not at the standard `.well-known` path relative to the issuer URL. |
-| `issuer.audienceMatchPolicy` | `MatchAny` — accept a token whose `aud` matches any listed audience. |
-| `claimMappings.uid` | Maps a claim to the Kubernetes user UID, useful for audit correlation. |
-| `claimMappings.extra` | Maps arbitrary claims into extra user attributes, consumable by authorization webhooks. |
-| `userValidationRules` | CEL rules validating the **mapped user** rather than the raw claims — for example asserting the username carries the expected prefix. A useful defence-in-depth layer on top of `claimValidationRules`. |
-
-##### `claims.?email_verified.orValue(true)` admits unverified identities
-
-```
-claims.?email_verified.orValue(true) == true
-```
-
-Piece by piece:
-
-- `claims.?email_verified` — CEL **optional chaining**. Yields the claim's value if present, or an
-  *empty optional* if absent. The `?` is what prevents a missing claim from erroring.
-- `.orValue(true)` — unwraps the optional, substituting **`true`** when the claim is absent.
-- `== true` — compares.
-
-So a token that **omits `email_verified` entirely** is treated as verified and **accepted**. The
-rule rejects only tokens explicitly asserting `email_verified: false` — inverting the intent stated
-in the very next line. Since the username derives from the email claim, a misconfigured client or an
-IdP that omits the claim can present an unverified — potentially someone else's — address as a
-Kubernetes identity.
-
-**The fix is one word:**
+#### API server FQDNs
 
 ```yaml
-              claimValidationRules:
-              - expression: 'claims.?email_verified.orValue(false) == true'
-                message: "email must be verified"
+        endpointFQDNs:
+        - api.k8s.example.com
 ```
 
-`orValue(false)` **fails closed**: absent claim means rejected. This is the correct default for any
-security predicate — when you cannot prove the condition holds, deny. Apply the same reasoning to
-every CEL rule you write.
+Adds FQDN aliases for the control plane endpoint, and the name goes into the API server certificate's
+SANs so TLS validation succeeds on it. Without that, connecting via the name fails validation even
+though the endpoint is reachable, and the error indicates a certificate problem rather than the
+configuration gap that caused it.
 
-> **You must also create RBAC inside the workload cluster.**
->
-> This configures authentication only. **A successfully authenticated user has zero permissions**
-> until an RBAC binding names them, and the resulting experience looks like a broken cluster rather
-> than a missing binding.
->
-> The subject name is the **fully composed username**: `claimMappings.username.prefix` concatenated
-> with the mapped claim value. With `prefix: "oidc:"` and `claim: email`, a user with the email
-> `user@example.com` is the Kubernetes user `oidc:user@example.com`.
->
-> Bindings are applied **inside the workload cluster**, not the vSphere Namespace:
->
-> ```yaml
-> apiVersion: rbac.authorization.k8s.io/v1
-> kind: ClusterRoleBinding
-> metadata:
->   name: oidc-admin
-> subjects:
-> - kind: User
->   name: "oidc:user@example.com"
->   apiGroup: rbac.authorization.k8s.io
-> roleRef:
->   kind: ClusterRole
->   name: cluster-admin
->   apiGroup: rbac.authorization.k8s.io
-> ```
->
-> Always verify the exact string the API server derives, rather than assuming:
-> ```bash
-> kubectl auth whoami
-> ```
-> Full guidance — group bindings and least privilege — in
-> [Appendix B.1](#b1-rbac-for-oidc-identities).
+Set this in the same domain you publish the UI on. If Headlamp is at `headlamp.k8s.example.com`, put
+the API server at `api.k8s.example.com`, and then kubeconfigs, CI runners, and the UI all reference
+stable names in one zone instead of a mix of names and IPs. The variable adds the name to the
+certificate; publishing the DNS record is still your job.
 
-##### Other `apiServerConfiguration` fields
+This replaces the deprecated `kubeAPIServerFQDNs` variable.
 
-| Field | Guidance |
-| --- | --- |
-| `profiling` | Exposes `/debug/pprof` on the API server. Available if you want to disable it, but **be cautious** — profiling endpoints are used by support tooling and diagnostics, so turning them off can complicate troubleshooting. Leave at the default unless a specific policy requires otherwise. |
-| `maxRequestsInFlight` / `maxMutatingRequestsInFlight` | API server concurrency limits. Raise for very large or controller-heavy clusters; the defaults suit most. |
-| `requestTimeout` | Timeout for non-long-running requests. |
-| `oidc.serviceAccountIssuerURL` | **A different feature from `extraAuthentication`.** This sets the issuer for *bound ServiceAccount tokens*, enabling workload identity federation with external systems. Unrelated to human login. |
-
-#### 7.7.7 Other `kubernetes` sub-variables
-
-| Field | Guidance |
-| --- | --- |
-| `security.minimumTLSProtocol` | `TLS_1.2` or `TLS_1.3`. **Handle with care — do not set this reflexively.** Raising the floor to `TLS_1.3` breaks any client, controller, webhook, or integration that has not been validated against it, and the failures are TLS handshake errors scattered across unrelated components. Only change it against a specific compliance requirement, with a tested inventory of every client that talks to the API server. |
-| `security.tlsCipherSuites` | Restricts accepted cipher suites. **Same caution, more sharply** — an over-narrow list is one of the easier ways to make a cluster partially unreachable, and the resulting errors do not name cipher negotiation as the cause. Leave at the platform default unless you have a defined cryptographic policy *and* a way to validate every client against it. |
-| `endpointFQDNs` | Additional FQDNs to include in the API server certificate SANs. Needed when reaching the API server through a load balancer or vanity DNS name — otherwise TLS validation fails on that name. Replaces the deprecated `kubeAPIServerFQDNs` variable. |
-| `kubeControllerManagerConfiguration.terminatedPodGCThreshold` | How many terminated pods are retained before garbage collection. Lower it on high-churn clusters — retained pod objects consume etcd space, which ties back to [7.7.2](#772-etcdconfiguration). |
-| `kubeProxyConfiguration.enabled` | Allows disabling kube-proxy, for CNIs that replace it (some Cilium modes). **Do not disable it unless your CNI explicitly requires it** — service networking stops working otherwise. |
-| `kubeletConfiguration.podPidsLimit` | Caps PIDs per pod. A worthwhile defence against fork-bomb-style resource exhaustion. |
-| `kubeletConfiguration.imageGCHighThresholdPercent` / `imageGCLowThresholdPercent` | Disk-usage thresholds for image garbage collection. Relevant to the containerd volume in [7.6](#76-volumes--dedicated-containerd-and-kubelet-disks) — tune together. |
-| `kubeletConfiguration.containerLogMaxSizeMiB` / `containerLogMaxFiles` | Bound per-container log growth. **Directly protects the `/var/lib/kubelet` volume** from a log-happy pod. |
-| `kubeletConfiguration.serializeImagePulls` / `maxParallelImagePulls` | Control image-pull concurrency. Parallel pulls speed up scale-out but can saturate the registry or the network. |
-| `kubeletConfiguration.imagePullCredentialsVerificationPolicy` | `NeverVerify`, `NeverVerifyPreloadedImages`, `NeverVerifyAllowlistedImages`, `AlwaysVerify`. `AlwaysVerify` prevents a pod from using an image cached on the node by another tenant without presenting its own credentials — **a genuine multi-tenancy control** worth enabling in shared clusters. |
-| `kubeletConfiguration.allowedUnsafeSysctls` | Only for specialised tuning. Taint such node pools and schedule only workloads that need them. |
-
-### 7.8 `bootstrapAddons` — CNI selection
+#### CNI
 
 ```yaml
     - name: bootstrapAddons
       value:
         cniRef:
-          name: antrea                        # ← the cluster's CNI
+          name: antrea
           namespace: vmware-system-vks-public
 ```
 
-| Consideration | Detail |
-| --- | --- |
-| Why it is separate | The CNI must be installed as the cluster bootstraps — nodes cannot become `Ready` and pods cannot get addresses without it. Hence "bootstrap" addons, configured here rather than as an `AddonInstall`. |
-| **Effectively irreversible** | **CNI is a create-time decision.** There is no supported in-place migration: changing it means building a new cluster and migrating workloads. |
-| Your options | List them with `kubectl get acd -n vmware-system-vks-public \| grep -E '^(antrea\|calico\|cilium)'`. A default catalogue offers **`antrea`**, **`calico`**, and **`cilium`**. |
-| **`antrea`** | The VMware-supported default. Integrates with the vSphere networking stack, supports Kubernetes NetworkPolicy plus richer Antrea policy CRDs, and handles the reserved `240.0.0.0/4` pod CIDR used here. **Choose this unless you have a specific reason not to.** |
-| **`calico`** | Mature, widely deployed, strong policy model. Reasonable if it is your organisational standard. |
-| **`cilium`** | eBPF-based, with advanced observability (Hubble), L7 policy, and the option to replace kube-proxy. Choose it if you want those capabilities and will operate them — note the `kubeProxyConfiguration.enabled` interaction in [7.7.7](#777-other-kubernetes-sub-variables). |
-| Interaction with Istio | Both manipulate pod networking. Normal and supported. At gateway-only Istio scope there is no interaction at all; if you later enable `istioCNI`, validate the combination in non-production first. |
+The CNI must be installed as the cluster bootstraps, since nodes cannot become `Ready` and pods cannot
+get addresses without it, which is why it is configured here rather than as an `AddonInstall`.
 
-### 7.9 `vsphereOptions` — persistent volume storage classes
+This is a create-time decision with no supported in-place migration: changing it means building a new
+cluster. A default catalogue offers `antrea`, `calico`, and `cilium`.
+
+Antrea is the VMware-supported default. It integrates with the vSphere networking stack, supports
+Kubernetes NetworkPolicy plus richer Antrea policy CRDs, and handles the reserved pod CIDR used here.
+Choose it unless you have a specific reason not to. Calico is mature and widely deployed with a strong
+policy model, reasonable if it is your organisational standard. Cilium is eBPF-based with advanced
+observability and L7 policy, and the option to replace kube-proxy; choose it if you want those
+capabilities and will operate them.
+
+The CNI and Istio both manipulate pod networking, which is normal and supported. At gateway-only Istio
+scope there is no interaction at all.
+
+#### Workload storage
 
 ```yaml
     - name: vsphereOptions
       value:
         persistentVolumes:
           availableStorageClasses:
-          - <STORAGE_CLASS>                   # ← classes offered to workloads
+          - <STORAGE_CLASS>
           defaultStorageClass: <STORAGE_CLASS>
 ```
 
-Distinct from the `storageClass` variable in [7.4](#74-storageclass): **that one is for the nodes'
-own disks, this one is for workload PersistentVolumeClaims.**
+Distinct from the `storageClass` variable in [7.3](#73-node-sizing): that one is for the nodes' own
+disks, this one is for workload PersistentVolumeClaims.
 
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `availableStorageClasses` | The allow-list exposed inside the workload cluster. Explicitly listing them is good practice — workloads cannot request policies you have not sanctioned. | **The class must be associated with your vSphere Namespace, and the error surfaces late.** A class named here but not associated is accepted at cluster-create time and fails at *PVC*-create time — so the first symptom is a workload whose PVC pends indefinitely with an unhelpful event, long after the cluster looked healthy. |
-| `defaultStorageClass` | The class used by PVCs that do not name one. **Setting a default matters** — without it, any chart that omits `storageClassName` produces a permanently pending PVC. | Only one class should be default. Consider whether your default should be your most expensive protection level; many teams default to a cheaper class and require explicit opt-in to premium storage. |
-| Single class | Simple and predictable. | Consider a tier set — a mirrored class for latency-sensitive databases, erasure-coded for capacity — so workloads can match storage to need. Every class must be namespace-associated. |
+Explicitly listing the available classes is good practice, since workloads cannot then request policies
+you have not sanctioned. Setting a default matters too, because without one any chart that omits
+`storageClassName` produces a permanently pending PVC. Consider whether your default should be your most
+expensive protection level; many teams default to something cheaper and require explicit opt-in to
+premium storage.
 
-> **One name, four places.** The StorageClass appears in `storageClass`, in both `volumes` entries,
-> and twice here. When you substitute your own, change all of them — a missed occurrence produces a
-> cluster that half-works.
+The class must be associated with your vSphere Namespace, and the error surfaces late. A class named
+here but not associated is accepted at cluster-create time and fails at PVC-create time, so the first
+symptom is a workload whose PVC pends indefinitely with an unhelpful event, long after the cluster
+looked healthy.
 
-### 7.10 `osConfiguration` — NTP and SSH banner
+A protection policy also needs enough hosts to satisfy placement. A RAID-5 or RAID-6 erasure-coding
+policy on too small a cluster is non-compliant, and provisioning either fails or silently produces
+objects that do not meet the stated protection level. Check compliance in vCenter after deployment.
+
+Consider offering a tier set rather than one class, so workloads can match storage to need.
+
+#### Time and access notices
 
 ```yaml
     - name: osConfiguration
@@ -2065,672 +1750,139 @@ own disks, this one is for workload PersistentVolumeClaims.**
             authorized users for authorized activities only. '
 ```
 
-#### NTP — a functional prerequisite, not hygiene
-
-| Consideration | Detail |
-| --- | --- |
-| Why it matters far more than it looks | Time synchronisation is load-bearing for **three** mechanisms in this manifest. **(1) TLS:** certificate validity is a time window; a skewed clock rejects valid certificates as not-yet-valid or expired. **(2) etcd:** leases and election timeouts are time-based, and skew between members causes election churn. **(3) OIDC:** every ID token carries `exp`, `iat`, and often `nbf` claims validated against the API server's clock. |
-| **The specific risk here** | This cluster authenticates humans with short-lived OIDC tokens. **A skew of even a few minutes rejects valid tokens** — or accepts expired ones. The symptom is intermittent, user-specific authentication failures that come and go as tokens refresh, which is close to undiagnosable if you are not looking at clocks. |
-| Pitfall | **The server must be reachable from the node network.** An unreachable NTP server is worse than none configured, because you believe time is managed. Verify sync after deployment. |
-| Recommendation | Configure **multiple** servers, and use the same sources as the rest of your infrastructure — including vCenter and ESXi — so the whole stack agrees. **Alert on clock skew.** |
-
-#### SSH banner
-
-| Consideration | Detail |
-| --- | --- |
-| Why | A legal and compliance control. Many frameworks require an explicit authorized-use notice before interactive access. |
-| Pitfall — YAML | Note the **trailing space** before the closing quote, and that this is a single-quoted scalar folded across two lines: YAML flow folding turns the newline plus indentation into one space, so the value is a single line. Preserve the quoting style — switching to a block scalar (`\|` or `>`) changes the resulting string, usually adding a newline you did not intend. |
-| Pitfall — content | Have legal or compliance supply the wording. A generic banner may not satisfy the regime you are audited against. |
-| Note | A banner is a deterrent and a notice, **not** an access control. Restrict node SSH by network policy, jump hosts, and key management. |
-
-### 7.11 `version`
-
-```yaml
-    version: v1.36.1---vmware.4-vkr.5
-```
-
-Covered in full in [section 2](#2-choosing-a-kubernetes-release-the-kr-object). In short: this must
-be the **`NAME`** of a `kr` object that is `READY=True` and `COMPATIBLE=True`, using the **triple
-dash**, and it must be compatible with the ClusterClass.
-
-[Appendix E](#appendix-e--inspecting-a-kubernetes-release-kr) covers what the release actually
-contains — etcd and CoreDNS versions, the version-pinned platform addons, and the OS images it offers
-— plus a pre-upgrade diff you can run between two releases.
-
-### 7.12 `workers.machineDeployments` — the node pool
-
-```yaml
-    workers:
-      machineDeployments:
-      - class: node-pool                       # ← a machine-deployment class from the ClusterClass
-        metadata:
-          annotations:
-            cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
-            cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
-            run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-        name: node-pool-1
-```
-
-| Field | Why | Pitfall |
-| --- | --- | --- |
-| `class: node-pool` | References a machine-deployment class defined by the ClusterClass; this entry instantiates it. | The class must exist in your ClusterClass. |
-| `name: node-pool-1` | Names the pool. | **Multiple pools are the mechanism for workload separation** — different VM classes, different `maxPods`, taints for GPU or memory-optimised workloads. One undifferentiated pool means every workload shares a node shape. Combine with the `node.labels` and `node.taints` variables ([7.13](#713-37-variables-not-used-in-the-sample)). |
-| autoscaler `min-size` / `max-size` | Declares the bounds the Cluster Autoscaler respects for this pool. | **These work** — the Cluster Autoscaler is installed by the platform ([section 3](#3-what-vks-installs-for-you)), so unlike some distributions you do not need to deploy it. Confirm with `kubectl get clusteraddon -n <VSPHERE_NAMESPACE> \| grep autoscaler`. |
-| `min-size: "1"` | — | A single worker means no capacity redundancy: one node failure and everything is unschedulable. **Use at least 2, ideally 3**, so a node can be lost or drained without an outage. |
-| `max-size: "5"` | — | **Sanity-check against the pod CIDR.** With a `/20` you have 16 blocks total, so 5 is safe — but raising this without widening the CIDR walks into the wall in [7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare). Also check against vSphere capacity and VM-class reservations. |
-| The **absence** of `replicas` | **Correct and deliberate.** A static `replicas` alongside an autoscaler-managed pool means two controllers fighting over the same field, producing oscillation. | If you deliberately disable autoscaling for a pool, you **must** set `replicas` — otherwise it has no size directive. Choose one model, never both. |
-| `resolve-os-image` | Matches the control plane's, keeping both on the same OS image. | Set it on **every** machine deployment you add. |
-
-### 7.13 3.7 variables not used in the sample
-
-Three ClusterClass variables the manifest does not touch.
-
-#### `resourceConfiguration.systemReserved` — how to size it
-
-Reserves CPU and memory for system daemons — kubelet, container runtime, OS — so pods cannot starve
-them. Starved system daemons produce `NotReady` nodes and cascading evictions.
-
-```yaml
-    - name: resourceConfiguration
-      value:
-        systemReserved:
-          automatic: true       # schema default
-```
-
-##### What the upstream documentation says
-
-The mechanism is upstream Kubernetes' **Node Allocatable** feature, documented in
-[Reserve Compute Resources for System Daemons](https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/).
-Two points from that page matter here:
-
-1. **Upstream deliberately publishes no recommended values.** There is no default and no formula —
-   the numbers are considered site-specific.
-2. **It warns explicitly against enforcing `systemReserved` casually.** The guidance is to *"enforce
-   `systemReserved` only if a user has profiled their nodes exhaustively to come up with precise
-   estimates and is confident in their ability to recover if any process in that group is
-   oom-killed,"* because an over-tight reservation can leave *"critical system services CPU
-   starved, OOM killed, or unable to fork on the node."*
-
-So: **prefer `automatic: true`, and override only with evidence.** That is not a cop-out — it is the
-upstream recommendation.
-
-##### Where public formulas do exist
-
-The two managed-Kubernetes providers that publish concrete reservation formulas are the usual
-reference points. They are worth knowing because they quantify the two different things that drive
-overhead:
-
-**CPU — a tiered percentage of core count** (identical in both
-[GKE](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/plan-node-sizes) and
-[EKS](https://docs.aws.amazon.com/batch/latest/userguide/memory-cpu-batch-eks.html)):
-
-| Cores | Reserved |
-| --- | --- |
-| 1st core | 6% |
-| 2nd core | 1% |
-| 3rd–4th core | 0.5% |
-| Every core above 4 | 0.25% |
-
-**Memory — GKE uses a tiered percentage of node memory:**
-
-| Memory tier | Reserved |
-| --- | --- |
-| Nodes under 1 GiB | 255 MiB flat |
-| First 4 GiB | 25% |
-| Next 4 GiB (4–8 GiB) | 20% |
-| Next 8 GiB (8–16 GiB) | 10% |
-| Next 112 GiB (16–128 GiB) | 6% |
-| Above 128 GiB | 2% |
-
-plus **100 MiB on every node** held back for pod eviction.
-
-**Memory — EKS instead scales with pod count**, which is the number relevant to `maxPods`:
-
-```
-kubeReserved memory = (11 MiB × max_pods) + 255 MiB
-```
-
-##### What VKS actually reserves
-
-You do not have to guess, and this is worth doing before you change anything:
-
-```bash
-kubectl get nodes -o custom-columns='NODE:.metadata.name,\
-CPU_CAP:.status.capacity.cpu,CPU_ALLOC:.status.allocatable.cpu,\
-MEM_CAP:.status.capacity.memory,MEM_ALLOC:.status.allocatable.memory,\
-MAXPODS:.status.capacity.pods'
-```
-
-The gap between `capacity` and `allocatable` **is** the total reservation plus the eviction threshold.
-
-Measured on a VKS 3.7 cluster with `automatic: true` and the default `maxPods: 110`:
-
-| Node | Class | Capacity | Allocatable | Reserved |
-| --- | --- | --- | --- | --- |
-| control plane | `guaranteed-large`-equivalent (4 vCPU / 16 GiB) | 4 / 15.6 GiB | 3920m / 12.96 GiB | **80m / 2722 MiB** |
-| worker | `guaranteed-medium`-equivalent (2 vCPU / 8 GiB) | 2 / 7.75 GiB | 1930m / 5.91 GiB | **70m / 1892 MiB** |
-
-**Those values match the GKE-published tiered formulas exactly** — CPU to the millicore, memory to
-within 1.2 MiB on both node sizes, once the 100 MiB eviction reserve is included:
-
-| Node | Predicted (GKE tiers + 100 MiB) | Measured | Delta |
-| --- | --- | --- | --- |
-| 4 vCPU / 15.6 GiB | 80m / 2723.2 MiB | 80m / 2722 MiB | 0m / +1.2 MiB |
-| 2 vCPU / 7.75 GiB | 70m / 1892.8 MiB | 70m / 1892 MiB | 0m / +0.8 MiB |
-
-So the tiered model above is a reliable predictor of what `automatic: true` will give you on a given
-VM class — useful for capacity planning before a node exists.
-
-> **Caveat on the fit.** Two node sizes is a good fit, not a guarantee, and this is not a
-> VMware-documented formula — VKS documents only the `automatic` flag, not its calculation. Treat the
-> model as a planning aid and confirm against your own nodes. It could change between releases.
-
-##### The gap when you raise `maxPods`
-
-Here is the reason this variable matters for pod density: **the memory reservation above is derived
-from node size, not pod count.** Raising `maxPods` from 110 to 250 more than doubles the kubelet and
-runtime bookkeeping per node while the automatic reservation does not move at all.
-
-The two providers each acknowledge this, and their numbers give you a defensible adder:
-
-| Source | Adjustment for higher pod density |
-| --- | --- |
-| EKS | Memory scales at **11 MiB per pod** |
-| GKE | *"If you increase the maximum Pods per node beyond 110, GKE reserves an extra **400 mCPU**"* |
-
-Combining them gives a starting point for an explicit override — automatic's node-size reservation,
-**plus** a pod adder:
-
-```
-memory = <automatic reservation for the VM class>  +  11 MiB × (maxPods − 110)
-cpu    = <tiered CPU reservation for the core count>  +  400m   (when maxPods > 110)
-```
-
-```yaml
-    # Example: a pool running maxPods: 250 on guaranteed-2xlarge (8 vCPU / 64 GiB)
-    - name: resourceConfiguration
-      value:
-        systemReserved:
-          automatic: false
-          cpu: 500m            #  90m tiered + 400m density adder
-          memory: 7Gi          # ~5.5Gi node-size tiers + 1.5Gi (11 MiB × 140 pods)
-```
-
-##### The consequence: high `maxPods` demands large nodes
-
-Reserved resources are subtracted from allocatable, so reservation and pod count together determine
-what is actually left per pod. Run this arithmetic before choosing a VM class — it is where an
-ambitious `maxPods` usually falls apart. Figures below use the tiered model plus the pod adder:
-
-| VM class | vCPU / Mem | Reserved @ 110 | Alloc @ 110 | Reserved @ 250 | Alloc @ 250 | Avg mem/pod @ 250 | Verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `guaranteed-medium` | 2 / 8 GiB | 70m / 1.85 GiB | 5.9 GiB | 470m / 3.35 GiB | 4.4 GiB | **~18 MiB** | **Unusable** |
-| `guaranteed-large` | 4 / 16 GiB | 80m / 2.65 GiB | 12.9 GiB | 480m / 4.15 GiB | 11.4 GiB | ~47 MiB | Unrealistic |
-| `guaranteed-xlarge` | 4 / 32 GiB | 80m / 3.60 GiB | 27.4 GiB | 480m / 5.10 GiB | 25.9 GiB | ~106 MiB | Tight; CPU-bound |
-| `guaranteed-2xlarge` | 8 / 64 GiB | 90m / 5.46 GiB | 56.6 GiB | 490m / 6.97 GiB | 55.1 GiB | ~226 MiB | **Workable** |
-| `guaranteed-4xlarge` | 16 / 128 GiB | 110m / 9.19 GiB | 115.0 GiB | 510m / 10.69 GiB | 113.5 GiB | ~465 MiB | Comfortable |
-
-> **The practical rule: if you raise `maxPods` to 250, plan on `guaranteed-2xlarge` or larger.**
-> And note **CPU usually binds before memory** — 8 vCPU across 250 pods is ~29 millicores each, which
-> suits many small services and nothing compute-bound. Size from your workload's actual requests, not
-> from the pod count.
-
-##### Practical guidance
-
-| Guidance | Detail |
-| --- | --- |
-| **At `maxPods: 110`, leave `automatic: true`** | The tiered reservation is well-matched to node size, and upstream advises against overriding without profiling. |
-| **Override only when you change pod density** | That is the case automatic does not cover, because its memory tier is node-size derived. |
-| **Set it per pool** | Use `variables.overrides` on the machine deployment so a dense pool gets a large reservation without imposing it on pools that do not need one. |
-| **Measure, then adjust** | Compare `capacity` against `allocatable` after deployment, and watch actual kubelet and runtime usage under load. The formulas are a starting point; your workload decides. |
-| **Do not over-reserve** | Every reserved core and gigabyte is capacity you paid for and cannot schedule. |
-| **Prefer erring high on memory, low on CPU** | Memory is incompressible — exhausting it OOM-kills system processes. CPU starvation degrades rather than kills, and upstream notes that reserving only compressible resources *"is less likely to cause disruption."* |
-| **Changing it** | Requires a machine rollout — which needs a spare pod CIDR block. |
-
-**References**
-
-- [Reserve Compute Resources for System Daemons](https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/) — upstream mechanism and cautions (no values published)
-- [GKE: Plan node sizes](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/plan-node-sizes) — tiered CPU and memory formulas, 100 MiB eviction reserve, +400 mCPU above 110 pods
-- [EKS / AWS Batch: Memory and vCPU considerations](https://docs.aws.amazon.com/batch/latest/userguide/memory-cpu-batch-eks.html) — `(11 MiB × max_pods) + 255 MiB`, and the tiered CPU table with worked examples
-
-> **On terminology.** Upstream splits reservations into `kube-reserved` (kubelet, container runtime)
-> and `system-reserved` (OS daemons, kernel). The provider formulas above are `kube-reserved`. VKS
-> exposes a single `systemReserved` knob, so if you override it, size it for **total** node overhead
-> rather than only the OS portion — and validate with the capacity-versus-allocatable check.
-
-#### `node.labels` — declarative node labels
-
-```yaml
-    - name: node
-      value:
-        labels:
-          workload-type: general
-          environment: production
-          cost-center: platform-eng
-```
-
-**Use this rather than labelling nodes by hand.** Labels applied with `kubectl label node` are lost
-when the node is replaced — which happens on every upgrade, every `vmClass` change, and every
-`volumes` resize. Labels set here are part of the node's declared configuration and survive
-replacement.
-
-| Use | Example |
-| --- | --- |
-| Scheduling | `workload-type: general` / `workload-type: memory-optimised`, targeted with `nodeSelector` or affinity |
-| Environment identification | `environment: production` — useful in dashboards, alerts, and audit queries |
-| Cost attribution | `cost-center: platform-eng` — chargeback and showback reporting |
-| Compliance scoping | A label marking nodes subject to a particular control set |
-
-Because this is a ClusterClass variable, it supports **per-pool overrides** — the same
-`variables.overrides` mechanism used for `vmClass` in [7.3](#73-control-plane). That is how you label
-one pool differently without duplicating the whole variable set:
-
-```yaml
-      machineDeployments:
-      - class: node-pool
-        name: node-pool-memory
-        variables:
-          overrides:
-          - name: node
-            value:
-              labels:
-                workload-type: memory-optimised
-          - name: vmClass
-            value: guaranteed-2xlarge
-```
-
-The `node` variable also carries `taints`, `cri.runtimeClasses`, and `firewall.inboundRules`. Those
-are specialised — reach for them when you have a concrete requirement, not as part of a baseline.
-
-#### `endpointFQDNs` — API server FQDN aliases
-
-```yaml
-    - name: kubernetes
-      value:
-        # Keep this in the same domain you publish the UI on, so the whole
-        # cluster is reachable by name rather than by IP.
-        endpointFQDNs:
-        - api.k8s.example.com
-```
-
-Adds FQDN aliases for the control plane endpoint — per the schema, *"for example to allow users to
-connect to the cluster using `https://k8s.prod.example.com/`"*. The name is added to the API server
-certificate's SANs, so TLS validation succeeds on it.
-
-**Set this alongside the Headlamp FQDN, in the same domain.** If you are publishing
-`headlamp.k8s.example.com` for the UI ([6.5](#65-headlamp)), publish `api.k8s.example.com` for the API
-server too — then a kubeconfig, a CI runner, and the UI all reference stable names in one zone
-instead of a mix of names and IPs.
-
-| Consideration | Detail |
-| --- | --- |
-| **Why it is needed** | Without the name in the certificate SANs, connecting via that name fails TLS validation — even though the endpoint is reachable. The error looks like a certificate problem, not a configuration gap. |
-| What to include | Every name clients will use: a vanity DNS name, a load balancer name, and any per-environment alias. |
-| DNS is still your job | This variable adds the name to the certificate; it does not create the DNS record. Publish an A record pointing at the control plane endpoint. |
-| Pair with a stable endpoint | An FQDN in front of the API server endpoint is what lets you change the underlying address without reissuing every kubeconfig. |
-| Supported scopes | `cluster` and `controlPlane`. |
-| Migration note | This **replaces the deprecated `kubeAPIServerFQDNs` variable**, which the schema marks for removal. If you have manifests using the old name, migrate them. |
+NTP matters more here than it looks. Time synchronisation is load-bearing for three separate mechanisms
+in this manifest: TLS, where certificate validity is a time window and a skewed clock rejects valid
+certificates; etcd, whose leases and election timeouts are time-based and where skew between members
+causes election churn; and OIDC, where every ID token carries `exp`, `iat`, and often `nbf` claims
+validated against the API server's clock.
+
+That last one is the specific risk. This cluster authenticates humans with short-lived tokens, so a skew
+of a few minutes rejects valid tokens or accepts expired ones, and the symptom is intermittent
+user-specific authentication failures that come and go as tokens refresh. That is close to
+undiagnosable if you are not looking at clocks.
+
+Configure multiple servers, use the same sources as the rest of your infrastructure including vCenter
+and ESXi, and alert on skew. An unreachable NTP server is worse than none configured, because you
+believe time is managed.
+
+The SSH banner is a compliance control; many frameworks require an explicit authorized-use notice
+before interactive access. Have legal or compliance supply the wording, since a generic banner may not
+satisfy the regime you are audited against. Note the trailing space and the single-quoted scalar folded
+across two lines: YAML flow folding turns the newline plus indentation into one space, so the value is a
+single line, and switching to a block scalar changes the string. A banner is a notice, not an access
+control; restrict node SSH by network policy, jump hosts, and key management.
 
 ---
 
-## 8. Cluster decisions you cannot change later
+## 8. Couplings that must agree
 
-> **What this covers.** The short list of `Cluster` fields that are immutable, or expensive enough to
-> treat as immutable.
->
-> **Why it matters.** Getting one of these wrong is not a configuration change, it is a cluster
-> rebuild and a workload migration. They are worth a deliberate decision before the first apply.
+Values that have to match something else, in another object, in DNS, or at your identity provider.
+These are the edits that break something apparently unrelated, so it is worth keeping the list next to
+your manifest. Each is explained where it belongs; this is a checklist, not a second explanation.
 
-A recap of the previous section, isolating what matters most. Most of the `Cluster` object is
-editable after deployment — but a small number of fields are not, and correcting one of them means
-building a new cluster and migrating every workload.
-
-**Settle these before you apply.** If you review nothing else in section 7, review this table.
-
-| Decision | Field | Why it is fixed | Get it right by |
-| --- | --- | --- | --- |
-| **Pod network size** | `clusterNetwork.pods.cidrBlocks` | Immutable. Determines your maximum node count, and an exhausted pod CIDR also blocks upgrades. | Sizing for maximum plausible scale plus a surge reserve — [7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare) |
-| **Service network size** | `clusterNetwork.services.cidrBlocks` | Immutable. Caps total `ClusterIP` Services. | Same exercise; `/20` is ~4,094 services |
-| **CNI** | `bootstrapAddons.cniRef` | No supported in-place migration path. | Choosing between `antrea`, `calico`, and `cilium` on day one — [7.8](#78-bootstrapaddons--cni-selection) |
-| **Cluster DNS domain** | `clusterNetwork.serviceDomain` | Baked into every service address and workload identity. | Leaving it as `cluster.local` unless you have a specific reason |
-| **Cluster name** | `metadata.name` | Embedded in every addon selector and `AddonConfig` name. | Following a naming convention from the start |
-| **Per-node pod block size** | Node CIDR mask | Create-time. Governs how the pod CIDR is subdivided. | Understanding the arithmetic in 7.1.1 first |
-
-Two more that are *technically* changeable but expensive enough to treat as day-one decisions:
-
-| Decision | Cost of changing later |
+| Must agree | Where |
 | --- | --- |
-| `volumes` capacity | **Rolling node replacement** of the whole pool — size generously up front |
-| `controlPlane.replicas` 1 → 3 | Supported, but a rolling change to plan into a maintenance window |
+| Cluster name | `Cluster.metadata.name` and every `AddonInstall` selector |
+| AddonConfig name | `<clusterName>-<addonRef.name>`, using the addon name not the install name |
+| vSphere Namespace | Identical on every `AddonInstall`, `AddonConfig`, and the `Cluster` |
+| OIDC client ID | Headlamp `oidc.clientID` and the API server's `audiences` |
+| OIDC issuer URL | Headlamp `oidc.issuerURL` and the API server's `issuer.url`, byte for byte |
+| Username string | `claimMappings.username.prefix` plus the mapped claim, and every RBAC subject in the cluster |
+| OIDC scope and claim | `oidc.scopes` must include the scope producing `claimMappings.username.claim` |
+| UI hostname | Headlamp `hostname`, the `callbackURL` host, a published DNS record, and a redirect URI registered at the provider |
+| DNS target | The Headlamp `Gateway`'s own LoadBalancer address, not the Istio ingress gateway's |
+| Gateway class | `gatewayApi.gateway.className` needs a matching controller installed |
+| StorageClass name | `storageClass`, each `volumes[].storageClass`, `availableStorageClasses`, `defaultStorageClass`, and all associated with the vSphere Namespace |
+| Node budget | Pod CIDR blocks must cover `controlPlane.replicas` plus every autoscaler maximum, plus a surge spare |
+| Density | `maxPods`, the VM class, and `systemReserved` sized together |
+| Block headroom | `maxPods` below the usable addresses in a per-node block, about 254 for a `/24` |
+| Version pairing | `topology.version` a `READY` and `COMPATIBLE` `kr`, supported by the ClusterClass |
+| OS image | The same `resolve-os-image` annotation on the control plane and every machine deployment |
+| API server names | Any name clients use listed in `endpointFQDNs` and published in DNS |
+| Namespace policy | A namespace whose workloads cannot meet the cluster PSS default needs explicit labels or an exemption |
+| Mesh and privilege | Adopting sidecar injection requires `istioCNI: true` for any PSS above `privileged` |
 
 ---
 
-## 9. Cross-object dependency map
+## 9. Operating the cluster
 
-> **What this covers.** Every value in the profile that must agree with a value somewhere else — in
-> another object, in DNS, or at your identity provider.
->
-> **Why it matters.** These are the failures where the symptom points away from the cause. Editing one
-> line in isolation breaks something that looks unrelated, and the error message rarely names the
-> field that is actually wrong.
+### 9.1 Health checks after deployment
 
-These values must agree across objects. Each is a place where editing one line in isolation breaks
-something that looks unrelated — and where the symptom points away from the cause. Worth keeping
-next to your manifest.
+Work outward from the Supervisor. Each layer depends on the one before, so checking in order localises
+a failure rather than leaving you guessing among five components.
 
-| # | Must match | Where | Symptom if mismatched |
-| --- | --- | --- | --- |
-| 1 | **Cluster name** | `Cluster.metadata.name` ≡ every `AddonInstall.spec.clusters[].selector.matchLabels[cluster.x-k8s.io/cluster-name]` | The addon is never installed. No error — the selector matches nothing. |
-| 2 | **AddonConfig name** | `AddonConfig.metadata.name` ≡ `<clusterName>-<AddonInstall.spec.addonRef.name>` — note this is the **addon** name, not the `AddonInstall` object name | Config skipped; addon runs on schema defaults. Check `spec.clusterName` is populated. |
-| 3 | **vSphere Namespace** | `metadata.namespace` identical on every `AddonInstall`, `AddonConfig`, and the `Cluster` | Objects never associate. |
-| 4 | **OIDC client ID** | Headlamp `oidc.clientID` ≡ apiserver `extraAuthentication.jwt[].issuer.audiences[]` | UI login succeeds, then every API call is unauthorised. |
-| 5 | **OIDC issuer URL** | Headlamp `oidc.issuerURL` ≡ apiserver `extraAuthentication.jwt[].issuer.url`, byte-for-byte | All tokens rejected as from an untrusted issuer. |
-| 6 | **Username composition** | apiserver `claimMappings.username.prefix` + mapped claim ≡ `subjects[].name` in every RBAC binding **inside the workload cluster** | Authentication works, authorization does not. Valid identity, zero permissions. |
-| 7 | **OIDC scope ↔ claim** | Headlamp `oidc.scopes` must include the scope producing `claimMappings.username.claim` | Token lacks the mapped claim; username mapping fails. |
-| 8 | **FQDN, DNS, and redirect URI** | Headlamp `hostname` ≡ `callbackURL` host ≡ a published DNS A record ≡ a redirect URI registered with the IdP | IdP refuses the redirect. The error appears on the provider's page, not in Kubernetes. |
-| 9 | **Gateway class ↔ controller** | Headlamp `gatewayApi.gateway.className` ⇒ the `istio` addon (with ingress enabled) **or** `contour` installed | `Gateway` never programmed; Headlamp unreachable with no clear cause. |
-| 10 | **DNS ↔ Gateway address** | The DNS record must point at the **Headlamp `Gateway`'s** own LoadBalancer IP, not the Istio ingress gateway's | Name resolves to the wrong endpoint. |
-| 11 | **StorageClass name** | `storageClass` ≡ each `volumes[].storageClass` ≡ `vsphereOptions.availableStorageClasses[]` ≡ `defaultStorageClass` — **and all associated with the vSphere Namespace** | Nodes fail to provision, or workload PVCs pend indefinitely. |
-| 12 | **Pod CIDR ↔ total nodes** | `pods.cidrBlocks` must supply one `/24` per node — all `autoscaler-node-group-max-size` values **plus** `controlPlane.replicas` — **plus a spare for upgrade surge** | Pods stay `Pending`; or a rolling upgrade stalls. Immutable, so the fix is a rebuild. |
-| 13 | **`maxPods` ↔ VM class ↔ `systemReserved`** | Pod density must be supported by node CPU/memory and system reservations | Node instability, evictions, `NotReady` kubelets under load. |
-| 14 | **`maxPods` ↔ per-node block** | `maxPods` must stay below the usable addresses in a per-node block (~254 for a `/24`) | Pod IP exhaustion on a single node while the cluster looks healthy. |
-| 15 | **K8s version ↔ ClusterClass** | `topology.version` must be a `READY`+`COMPATIBLE` `kr`, supported by `topology.classRef.name` | Topology never reconciles. |
-| 16 | **OS image annotation** | Identical `resolve-os-image` on the control plane and every machine deployment | Pools drift onto different OS images. |
-| 17 | **API server FQDN ↔ certificate SANs** | Any name clients use must be listed in `kubernetes.endpointFQDNs` **and** published in DNS | TLS validation fails on that name; looks like a certificate problem, not a config gap. |
-| 18 | **PSS level ↔ namespace labels** | A namespace whose workloads cannot meet the cluster default needs explicit PSA labels, or membership of `exemptions.namespaces` | Pods rejected at admission; `helm install --create-namespace` fails ([7.7.3](#773-securitypodsecuritystandard)). |
-| 19 | **`maxPods` ↔ `systemReserved` ↔ VM class** | All three must be sized together | Node instability at density; or a node whose allocatable capacity cannot host the pods it admits. |
-| 20 | **PSS level ↔ Istio scope** | If you adopt sidecar injection, `istioCNI.enabled: true` is required for PSS above `privileged` | Injected pods rejected at admission. |
-
----
-
-## 10. Consolidated pitfalls
-
-> **What this covers.** The failure modes this profile can produce, each as symptom → cause → fix,
-> ordered by severity combined with how hard it is to diagnose.
->
-> **Why it matters.** Most of these present at a different layer than their cause — a broken login
-> that is really a missing RBAC binding, a stalled upgrade that is really an exhausted IP range,
-> cluster instability that is really hypervisor contention. Recognising the symptom saves the search.
-
-Ordered by severity combined with how hard the problem is to diagnose from its symptom.
-
-### 1. A claim validation rule that fails open
-
-| | |
-| --- | --- |
-| **Symptom** | None. The cluster works and the rule appears to enforce email verification. That is what makes it dangerous. |
-| **Cause** | `claims.?email_verified.orValue(true) == true` substitutes `true` when the claim is **absent**, so a token omitting it is accepted. Only an explicit `false` is rejected. Since the username derives from the email claim, an unverified address becomes a cluster identity. |
-| **Fix** | `orValue(false)` — fail closed. |
-| **Principle** | Every CEL security predicate should use `orValue(false)`. If you cannot prove the condition holds, deny. |
-
-### 2. An `AddonConfig` that is silently skipped
-
-| | |
-| --- | --- |
-| **Symptom** | The addon deploys and runs, but none of your configured values took effect. |
-| **Cause** | `spec.clusterName` and `spec.addonConfigDefinitionRef` are normally derived from the `<clusterName>-<addonName>` object name. If the name does not resolve — a typo, a renamed cluster, or using the `AddonInstall` name instead of the addon name — both stay empty and, per the API docs, *"the AddonConfig will skip the reconciliation."* |
-| **Detect** | `kubectl get addonconfig <name> -n <ns> -o jsonpath='{.spec.clusterName}'` — empty means skipped. Also check `READY` on `kubectl get addonconfig` and `kubectl get clusteraddon`. |
-| **Fix / prevent** | Set `spec.clusterName` and `spec.addonConfigDefinitionRef` **explicitly** in generated manifests. It also pins the addon release. |
-| **Classic instance** | The `AddonInstall` named `cluster-prom` installs the addon `prometheus`, so the config must be `<cluster>-prometheus`. Naming it `-prom` matches nothing. |
-
-### 3. OIDC client secret in plaintext
-
-| | |
-| --- | --- |
-| **Symptom** | None until the credential is abused. |
-| **Cause** | `oidc.clientSecret` inline in an `AddonConfig` is stored unencrypted in etcd, visible to anyone with read access, present in `kubectl get -o yaml`, and committed to any repository holding the manifest — including its history. |
-| **Fix** | Reference a Kubernetes Secret instead. Check your addon's schema for the supported field (commonly an `existingSecret` or `clientSecretRef` pattern), and manage the Secret with sealed-secrets, external-secrets, or the **`vault-injector`** addon so the manifest stays committable. |
-| **If already committed** | **Rotate the secret at the identity provider.** Removing it from the working tree does not remove it from Git history. |
-
-### 4. Pod CIDR exhaustion blocks upgrades
-
-| | |
-| --- | --- |
-| **Symptom** | Two forms. **(a)** Nodes join and report `Ready` but pods stay `Pending`, with no error mentioning addressing. **(b)** Worse: a rolling upgrade stalls partway, leaving a mixed-version cluster, because the surge node has no pod CIDR block. |
-| **Cause** | The pod CIDR is a pool of fixed-size per-node blocks (`/24` by default), not a flat pool of IPs. A `/20` yields 16 blocks for the whole cluster. Every rolling replacement is surge-then-remove, so **one block must always be free**. |
-| **Fix** | None in place — **the pod CIDR is immutable.** A cluster that has consumed all blocks cannot even be upgraded out of the situation. |
-| **Prevention** | Size for maximum plausible nodes **plus 2–3 spare blocks**. Use a `/16`. Consider raising `maxPods` for density instead of adding nodes. See [7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare). |
-| **If already deployed** | Cap total autoscaler `max-size` below `blocks − controlPlane.replicas − reserve`, and verify a free block before every rolling operation. |
-
-### 5. Missing RBAC after OIDC login
-
-| | |
-| --- | --- |
-| **Symptom** | Users authenticate successfully and then see permission errors everywhere. The UI looks broken. |
-| **Cause** | Authentication is not authorization. A valid identity with no RBAC binding has zero permissions. |
-| **Fix** | Create bindings **inside the workload cluster** naming the fully composed username — prefix plus claim. Verify the exact string with `kubectl auth whoami`. See [Appendix B.1](#b1-rbac-for-oidc-identities). |
-
-### 6. A Gateway with no controller
-
-| | |
-| --- | --- |
-| **Symptom** | Headlamp pods run and are healthy, but the URL is unreachable. |
-| **Cause** | `gatewayApi.gateway.className` names a controller that does not exist — neither the `istio` addon (with `gateways.ingress.enabled: true`) nor `contour` is installed. |
-| **Detect** | `kubectl get gateway -A` — `PROGRAMMED` is not `True` and `ADDRESS` is empty. |
-| **Fix** | Install a gateway controller addon. The Gateway API **CRDs** are platform-provided, so their presence does not imply a controller exists. |
-
-### 7. Hostname, DNS, and redirect URI drift
-
-| | |
-| --- | --- |
-| **Symptom** | Login fails at the identity provider with a redirect-mismatch error, or the URL does not resolve. |
-| **Cause** | `hostname`, `callbackURL`, the DNS record, and the IdP's registered redirect URI must all agree. Any hostname derived from the LoadBalancer IP — including wildcard-DNS shortcuts — breaks all four at once whenever that IP changes. |
-| **Fix** | Use a stable FQDN with a reserved LoadBalancer IP. If you want the record maintained automatically, see [Appendix D.3](#d3-dns-automation-external-dns). |
-
-### 8. Prometheus operator with no `Prometheus` CR
-
-| | |
-| --- | --- |
-| **Symptom** | Monitoring appears deployed — operator, exporters, and Alertmanager all running — but there are no metrics to query and no alerts ever fire. |
-| **Cause** | `prometheus: false` deploys the operator without a server. The operator does nothing until you create a `Prometheus` custom resource. |
-| **Detect** | `kubectl get prometheus,alertmanager,servicemonitor -A` → `No resources found`. |
-| **Fix** | Create the `Prometheus` CR ([Appendix B.3](#b3-a-prometheus-instance-via-the-operator)), or point a central Prometheus at this cluster's exporters. |
-
-### 9. The IdP emits no `groups` claim
-
-| | |
-| --- | --- |
-| **Symptom** | Group-based RBAC bindings never apply. Individual user bindings work. |
-| **Cause** | Many providers do not include a `groups` claim by default — some need a specific scope, some need the claim added to the token explicitly, some need a directory-API integration. |
-| **Fix** | **Inspect a real ID token before designing RBAC around groups.** Then either configure the IdP to emit the claim, use an identity broker (Dex, Keycloak) to enrich tokens, or fall back to user bindings. |
-
-### 10. Pod Security versions pinned to `latest`
-
-| | |
-| --- | --- |
-| **Symptom** | Workloads that deployed cleanly before a cluster upgrade are rejected at admission afterwards. |
-| **Cause** | `enforceVersion: latest` tracks whatever the running Kubernetes version defines, and PSS definitions tighten over time. |
-| **Fix** | Pin an explicit version, then raise it deliberately as a separate, tested change. |
-
-### 11. StorageClass or VM class not associated with the vSphere Namespace
-
-| | |
-| --- | --- |
-| **Symptom** | Machines never provision, or PVCs pend indefinitely with an unhelpful event — long after the cluster looked healthy. |
-| **Cause** | The resource exists in vCenter but is not added to the vSphere Namespace. The `Cluster` object is accepted regardless; validation happens at consumption time. |
-| **Fix** | Verify with `kubectl describe ns <ns> \| grep storageclass` and `kubectl get virtualmachineclass` **before** applying. |
-
-### 12. `best-effort` VM classes in production
-
-| | |
-| --- | --- |
-| **Symptom** | Intermittent `NotReady` kubelets, etcd leader-election churn, failed liveness probes, random timeouts. Reads as "Kubernetes is flaky." |
-| **Cause** | `best-effort` classes carry no resource reservation. Under vSphere contention the hypervisor delivers less than the node advertises, while Kubernetes schedules against the advertised capacity. |
-| **Fix** | `guaranteed-*` classes, always for the control plane. |
-| **Why it is worth calling out** | The failure presents at the wrong layer, so teams spend days debugging Kubernetes for a hypervisor resource problem. |
-
-### 13. Clock skew breaks OIDC intermittently
-
-| | |
-| --- | --- |
-| **Symptom** | Authentication fails for some users some of the time, resolving on retry. |
-| **Cause** | ID tokens carry `exp`/`iat`/`nbf` claims validated against the API server's clock. |
-| **Fix** | Verify NTP is actually synchronising on every node — a configured but unreachable server is worse than none. Alert on skew. |
-
-### 14. etcd read-only after exceeding its quota
-
-| | |
-| --- | --- |
-| **Symptom** | Every write fails; reads work. Presents as a total outage. |
-| **Cause** | A `NOSPACE` alarm on exceeding `maximumDBSizeGiB` put etcd read-only. It does not clear on its own. |
-| **Fix** | Compact, defragment, disarm the alarm — all needing etcd-level access when the control plane appears dead. |
-| **Prevention** | Alert on etcd DB size at 60–70% of the quota. Consider lowering `terminatedPodGCThreshold` on high-churn clusters. |
-
-### 15. Istio `pilot.replicas` fighting its own HPA
-
-| | |
-| --- | --- |
-| **Symptom** | istiod replica count oscillates; reconcile loops churn. |
-| **Cause** | A static `replicas` alongside `autoscaling.enabled: true`. The HPA owns `spec.replicas`. |
-| **Fix** | Remove the static value; express intent through `minReplicas`/`maxReplicas`. |
-
-### 16. `maxPods` raised without matching node resources
-
-| | |
-| --- | --- |
-| **Symptom** | Nodes accept many pods, then become unstable — evictions, `NotReady`, slow kubelet responses. |
-| **Cause** | Pod density raised without CPU/memory to match, or without `systemReserved` protecting system daemons. |
-| **Fix** | Size the VM class to the pod count and override `resourceConfiguration.systemReserved` — the automatic reservation is node-size derived and does not grow with `maxPods` ([7.13](#713-37-variables-not-used-in-the-sample)). Keep sustained density below ~220–230 on a `/24` block. |
-
----
-
-## 11. Verification and troubleshooting
-
-> **What this covers.** Nine checks, working outward from the Supervisor to identity and IP headroom,
-> each with the command to run and what a healthy result looks like.
->
-> **Why it matters.** Checking in order localises a failure instead of leaving you guessing among five
-> components. Several of these checks also answer questions the object status does not surface.
-
-Work outward from the Supervisor. Each layer depends on the one before, so checking in order
-localises a failure instead of leaving you guessing among five components.
-
-### Layer 1 — Supervisor: does the cluster exist?
+**The cluster exists.**
 
 ```bash
 kubectl get cluster,machinedeployment,machine -n <VSPHERE_NAMESPACE>
 kubectl describe cluster <CLUSTER_NAME> -n <VSPHERE_NAMESPACE>   # conditions live here
 ```
 
-**Healthy:** `Cluster` is `Provisioned` with `AVAILABLE=True`; every `Machine` is `Running`;
-`CP AVAILABLE` matches `CP DESIRED`.
+The `Cluster` should be `Provisioned` and `AVAILABLE=True`, every `Machine` `Running`, and
+`CP AVAILABLE` matching `CP DESIRED`. Machines stuck here usually mean the `resolve-os-image` selector
+does not resolve, the VM class or storage policy is not associated with the namespace, or
+`topology.version` names a release that is not `READY` and `COMPATIBLE`.
 
-**If machines are stuck:** check that the `resolve-os-image` selector resolves, that the VM class and
-storage policy are associated with the namespace, and that `topology.version` names a `READY` +
-`COMPATIBLE` `kr`.
-
-### Layer 2 — Addons: installed, bound, and ready?
-
-**The one command that shows everything:**
+**Addons are installed, bound, and ready.**
 
 ```bash
 kubectl get clusteraddon -n <VSPHERE_NAMESPACE>
-```
 
-`READY=True` on every row, with the resolved `RELEASE` visible. This also shows the
-platform-installed addons, so it confirms the autoscaler and Gateway API are present.
-
-**Then check config binding** — the silent-skip failure in
-[Pitfall 2](#2-an-addonconfig-that-is-silently-skipped):
-
-```bash
-# every AddonConfig, with the cluster and definition it resolved to
 kubectl get addonconfig -n <VSPHERE_NAMESPACE> \
   -o custom-columns='CONFIG:.metadata.name,CLUSTER:.spec.clusterName,DEFINITION:.spec.addonConfigDefinitionRef.name'
 ```
 
-**Any empty `CLUSTER` or `DEFINITION` means that config is being skipped** and the addon is running
-on schema defaults.
+`READY=True` on every `ClusterAddon`, and no empty `CLUSTER` or `DEFINITION` on any config. The second
+command is the one that catches a silently skipped config.
+
+**Packages reconciled inside the cluster.** Switch context.
 
 ```bash
-kubectl get addoninstall -n <VSPHERE_NAMESPACE> \
-  -o custom-columns='INSTALL:.metadata.name,ADDON:.spec.addonRef.name'
-```
-
-Each `AddonConfig` name must be `<CLUSTER_NAME>-<ADDON>` using the **`ADDON`** column.
-
-### Layer 3 — Guest cluster: did the packages reconcile?
-
-Switch to the workload cluster context. Addons are **Carvel packages**, so this is where their real
-status lives:
-
-```bash
+# Workload cluster context.
 kubectl get pkgi -A
+kubectl describe pkgi <name> -n vmware-system-tkg      # if one failed
 ```
 
-**Healthy:** every `PackageInstall` shows `Reconcile succeeded` in `DESCRIPTION`.
+Every `PackageInstall` should say `Reconcile succeeded`.
 
-**If one failed**, that is where the error is:
-
-```bash
-kubectl describe pkgi <name> -n vmware-system-tkg
-kubectl logs -n <kapp-controller-namespace> -l app=kapp-controller --tail=100
-```
-
-> **Do not look for `HelmRelease` objects** — the addons do not use them. `kubectl get helmrelease -A`
-> returns nothing unless you have created your own via the helm-controller addon.
-
-### Layer 4 — Istio and the ingress gateway
+**Istio and the ingress gateway.**
 
 ```bash
+# Workload cluster context.
 kubectl get pods -n istio-system      # istiod
-kubectl get pods -n istio-ingress     # the gateway
+kubectl get pods -n istio-ingress
 kubectl get svc -n istio-ingress      # EXTERNAL-IP must be populated
-
-# confirm the deployment scope: blank columns = gateway-only, no mesh
-kubectl get ns -L istio-injection,istio.io/dataplane-mode
 ```
 
-**If `EXTERNAL-IP` is `<pending>`:** a load-balancer problem — VIP pool exhaustion or LB
-misconfiguration — not an Istio problem.
+An `EXTERNAL-IP` stuck at `<pending>` is a load-balancer problem, VIP pool exhaustion or LB
+misconfiguration, not an Istio problem.
 
-### Layer 5 — Gateway API, Headlamp, and TLS
-
-```bash
-# CRDs are platform-provided; confirm anyway
-kubectl get crd | grep gateway.networking.k8s.io
-
-# is the Gateway programmed, and what is its address?
-kubectl get gateway,httproute -A
-```
-
-**Healthy:** `PROGRAMMED=True` with a populated `ADDRESS`. **That address is what DNS must point
-to** — it is the Gateway's own LoadBalancer, not the Istio ingress gateway's:
+**Gateway API, the UI, and its certificate.**
 
 ```bash
-kubectl get svc -n headlamp        # headlamp-gateway-<class> LoadBalancer + EXTERNAL-IP
-```
+# Workload cluster context.
+kubectl get gateway,httproute -A       # PROGRAMMED True, ADDRESS populated
+kubectl get svc -n headlamp            # the LoadBalancer DNS should point at
 
-**Check what is terminating TLS and who issued it:**
-
-```bash
 kubectl get certificate,issuer -n headlamp
 
-# which listener terminates TLS, with what, and for which hostname
 JP='{range .spec.listeners[*]}{.name}{"  "}{.protocol}{":"}{.port}'
 JP+='{"  hostname="}{.hostname}{"  tls="}{.tls.mode}'
 JP+='{"  secret="}{.tls.certificateRefs[0].name}{"\n"}{end}'
 kubectl get gateway headlamp-gateway -n headlamp -o jsonpath="$JP"
 ```
 
-```
-https-headlamp  HTTPS:443  hostname=headlamp.k8s.example.com  tls=Terminate  secret=headlamp-tls-cert
-```
-
-A `READY=True` `Certificate` from a self-signed `Issuer` is the addon default. For production you
-want an issuer backed by a trusted CA ([Appendix B.2](#b2-trusted-tls-for-the-headlamp-gateway)).
-
-**Then confirm the chain from outside the cluster:**
+Then confirm the chain from outside:
 
 ```bash
+# Run from a workstation with network access to the FQDN.
 openssl s_client -connect headlamp.k8s.example.com:443 -servername headlamp.k8s.example.com </dev/null 2>&1 | head -20
 ```
 
-### Layer 6 — Storage
+**Storage.**
 
 ```bash
-kubectl get storageclass                                     # in the workload cluster
-
+# Workload cluster context.
 kubectl apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -2743,265 +1895,183 @@ spec:
       storage: 1Gi
 EOF
 
-kubectl get pvc storage-smoke-test          # expect Bound within seconds
+kubectl get pvc storage-smoke-test          # Bound within seconds
 kubectl describe pvc storage-smoke-test     # events explain any delay
 kubectl delete pvc storage-smoke-test
 ```
 
-Omitting `storageClassName` is deliberate — it verifies `defaultStorageClass` is in effect.
-**If it pends:** the class is almost certainly not associated with the vSphere Namespace, or the
-storage policy is non-compliant for your host count.
+Omitting `storageClassName` is deliberate: it verifies the default class is in effect.
 
-### Layer 7 — Identity: what username does the API server see?
-
-The critical question is not "can I log in" but **"what username does the API server think I am"** —
-everything in RBAC depends on that exact string.
+**Identity.** The question is not whether you can log in, it is what username the API server thinks you
+are, because everything in RBAC depends on that exact string.
 
 ```bash
+# Workload cluster context.
 kubectl auth whoami
-kubectl auth whoami --token="<ID_TOKEN>"     # or with a token directly
+kubectl auth can-i --list
 ```
 
-**Expect** `<prefix><claim value>` — e.g. `oidc:user@example.com`.
-
-| Observation | Likely cause |
-| --- | --- |
-| Rejected: invalid issuer | `issuer.url` does not match the token's `iss` byte-for-byte |
-| Rejected: invalid audience | The client ID is not in the API server's `audiences` list |
-| Username missing its prefix, or unexpected | `claimMappings.username` does not match a claim actually present in the token |
-| Groups list empty | Your IdP is not emitting a `groups` claim ([Pitfall 9](#9-the-idp-emits-no-groups-claim)) |
-| Intermittent failures that resolve on retry | Clock skew ([Pitfall 13](#13-clock-skew-breaks-oidc-intermittently)) |
-| Rejected with a TLS error | The IdP's certificate is not trusted — set `issuer.certificateAuthority` |
-
-**Inspect the actual token** when claims are in doubt — do not guess at what your IdP emits:
+Expect the prefix plus the claim value, so `oidc:user@example.com`. When claims are in doubt, read the
+token rather than guessing at what your provider emits:
 
 ```bash
-# the JWT payload is base64url-encoded; translate the alphabet and pad it
 echo "<ID_TOKEN>" | cut -d. -f2 | tr '_-' '/+' | sed 's/$/===/' | base64 -d 2>/dev/null; echo
 ```
 
-```
-{"email":"user@example.com","email_verified":true,"iss":"https://idp.example.com", ...}
-```
-
-Then verify authorization **separately** — authentication succeeding says nothing about permissions:
+**Observability.**
 
 ```bash
-kubectl auth can-i --list
-kubectl auth can-i get pods --all-namespaces
-```
-
-An authenticated user with no binding can do nothing. That is
-[Pitfall 5](#5-missing-rbac-after-oidc-login), not a broken login.
-
-### Layer 8 — Observability: is anything actually evaluating rules?
-
-```bash
+# Workload cluster context.
 kubectl get pods -n tanzu-system-monitoring
 kubectl get prometheus,alertmanager,servicemonitor,prometheusrule -A
 ```
 
-**`No resources found` on the CRs means the operator is idle** — exporters are producing metrics and
-nothing is scraping them ([Pitfall 8](#8-prometheus-operator-with-no-prometheus-cr)). Know where rule
-evaluation happens: a `Prometheus` CR here, or an external Prometheus scraping this cluster.
+Know where rule evaluation happens: either a `Prometheus` CR here, or an external Prometheus scraping
+this cluster.
 
-### Layer 9 — Pod CIDR headroom
-
-Run this **before** any upgrade or rolling change:
+**Pod CIDR headroom.** Run this before any upgrade or rolling change.
 
 ```bash
-# what each node holds
+# Workload cluster context.
 kubectl get nodes -o custom-columns='NODE:.metadata.name,POD_CIDR:.spec.podCIDR,MAXPODS:.status.capacity.pods'
-
-# how many blocks are consumed
 kubectl get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}' | sort -u | wc -l
 ```
 
-Compare against your total — 16 for a `/20`, 256 for a `/16`. **If the count equals the total, do not
-start a rolling operation** ([Pitfall 4](#4-pod-cidr-exhaustion-blocks-upgrades)).
+Compare against your total, 16 for a `/20` and 256 for a `/16`. If the count equals the total, do not
+start.
 
----
+### 9.2 Upgrades
 
-## 12. Day-2 lifecycle
-
-> **What this covers.** Upgrades and their sequencing, which field edits replace nodes, addon version
-> management, certificate rotation, etcd growth, and tightening Pod Security after the fact.
->
-> **Why it matters.** Several values in the profile only reveal their cost at upgrade time — a
-> single-replica control plane, an undersized pod CIDR, a 30Gi volume. This section is where those
-> bills come due, and where the pre-flight checks live.
-
-### Upgrade sequencing
-
-The dependency runs bottom-up. Going the other way produces objects referencing things that do not
+The dependency runs bottom-up, and going the other way produces objects referencing things that do not
 exist yet.
 
-1. **Supervisor / VKS platform** — first; it provides everything below.
-2. **Confirm the new ClusterClass and `kr` releases are available and compatible**
-   (`kubectl get kr`, `kubectl get clusterclass -n vmware-system-vks-public`).
-3. **Diff the new ClusterClass variable schema against the old one.** Variables can be added,
-   renamed, or removed between generations. Do this *before* the upgrade.
-4. **Diff the two `kr` objects.** A Kubernetes *patch* bump can carry a CNI upgrade, a kapp-controller
-   minor bump, and an etcd patch — verified between two v1.36 releases in
-   [Appendix E.2](#e2-specbootstrappackages--the-platform-addons-pinned-to-the-release). There is a
-   ready-made change report in [Appendix E.4](#e4-a-pre-upgrade-change-report). Confirm your
-   `resolve-os-image` annotation still resolves against the target release while you are there.
-5. **`topology.version`** — one minor version at a time. Skipping minors is unsupported.
-6. **`topology.classRef.name`** — when moving to a new ClusterClass generation.
-7. **Addon releases** — last.
+1. Upgrade the Supervisor and VKS platform first; it provides everything below.
+2. Confirm the new ClusterClass and `kr` releases are available and compatible.
+3. Diff the new ClusterClass variable schema against the old one. Variables can be added, renamed, or
+   removed between generations.
+4. Diff the two `kr` objects. A Kubernetes patch bump can carry a CNI upgrade, a kapp-controller minor
+   bump, and an etcd patch. [Appendix D](#appendix-d-reading-a-kubernetes-release-object) has a
+   ready-made change report, and while you are there confirm your `resolve-os-image` annotation still
+   resolves against the target release.
+5. Bump `topology.version`, one minor version at a time.
+6. Bump `topology.classRef.name` when moving to a new ClusterClass generation.
+7. Addon releases last.
 
-**Pre-flight checklist:**
+Before starting: a free pod CIDR block exists, PodDisruptionBudgets cover critical workloads, the pool
+has capacity to lose a node, backups are current if you run them and a restore has been tested, and you
+have a window if the control plane is single-replica. Upgrade non-production first.
 
-| Check | Why |
-| --- | --- |
-| A **free pod CIDR block** exists | Surge nodes need one; without it the rollout stalls ([Layer 9](#layer-9--pod-cidr-headroom)) |
-| The **`kr` change report** has been read | A patch bump may move the CNI and kapp-controller ([Appendix E.4](#e4-a-pre-upgrade-change-report)) |
-| PodDisruptionBudgets exist for critical workloads | Otherwise a drain can take all replicas down at once |
-| The pool can lose a node | Capacity headroom for the surge and the drain |
-| A maintenance window, if `controlPlane.replicas: 1` | Every control-plane step is an API outage |
-| Backups are current, if you run them, and **a restore has been tested** | See [Appendix D.1](#d1-backup-and-restore-velero) |
-| Non-production upgraded first | Always |
-
-### Which changes replace nodes
+Which changes replace nodes, so you can predict the disruption:
 
 | Change | Effect |
 | --- | --- |
-| `topology.version` | Rolling replacement of all nodes, control plane first |
-| `topology.classRef.name` | Rolling replacement |
+| `topology.version`, `topology.classRef.name` | Rolling replacement of all nodes, control plane first |
 | `vmClass` | Rolling replacement of the affected pool |
-| `volumes` (add or resize) | **Rolling replacement** — not in-place |
-| `kubeletConfiguration` (including `maxPods`) | **Rolling replacement** — the schema states this explicitly |
+| `volumes`, add or resize | Rolling replacement |
+| `kubeletConfiguration`, including `maxPods` | Rolling replacement; the schema states this explicitly |
 | `resourceConfiguration.systemReserved` | Rolling replacement |
-| `node.labels` / `node.taints` | Rolling replacement |
+| `node.labels`, `node.taints` | Rolling replacement |
 | `resolve-os-image` annotation | Rolling replacement |
-| `replicas` / autoscaler bounds | Scale operation only; existing nodes untouched |
-| `certificateRotation`, `etcdConfiguration`, PSS, `apiServerConfiguration` | Control-plane reconfiguration; no worker replacement |
-| `clusterNetwork` CIDRs | **Immutable** — requires a new cluster |
-| `bootstrapAddons.cniRef` | **Effectively immutable** — requires a new cluster |
+| `replicas` or autoscaler bounds | Scale operation only, existing nodes untouched |
+| `certificateRotation`, `etcdConfiguration`, PSS, `apiServerConfiguration` | Control-plane reconfiguration, no worker replacement |
+| `clusterNetwork` CIDRs | Immutable, requires a new cluster |
+| `bootstrapAddons.cniRef` | Effectively immutable, requires a new cluster |
 
-**Every rolling replacement needs a free pod CIDR block.** That single fact ties most of this section
+Every rolling replacement needs a free pod CIDR block, which is the fact that ties most of this
 together.
 
-### Addon lifecycle
+### 9.3 Ongoing maintenance
 
-- **Pin and promote deliberately.** Naming the `acd` explicitly in `spec.addonConfigDefinitionRef`
-  pins the release; otherwise the platform resolves one and it can move on upgrade.
-- **Re-verify your `AddonConfig` against the new schema after any addon upgrade.** Fields can be
-  added, renamed, or relocated, and a field at the wrong nesting level is not applied — so an upgrade
-  can quietly revert a setting to its default. Diff against a fresh
-  `vcf addon available-releases get` or `kubectl get acd ... -o yaml`.
-- **Deletion:** `owned-for-deletion: "true"` ties each config's lifecycle to its addon and cluster.
-  If a manifest lacked it, sweep for orphans — because binding is name-derived, an orphan will be
-  silently adopted by a future cluster reusing the name:
-  ```bash
-  kubectl get addonconfig -n <VSPHERE_NAMESPACE>
-  ```
-- **Adding an addon is a normal day-2 operation.** Apply the `AddonInstall` (and optional
-  `AddonConfig`); no ordering to observe, no cluster restart.
+**Addon versions.** Naming the `acd` in `spec.addonConfigDefinitionRef` pins a release; otherwise the
+platform resolves one and it can move on upgrade. After any addon upgrade, re-verify your `AddonConfig`
+against the new schema, because fields can be added, renamed, or relocated, and a field at the wrong
+nesting level is not applied. An upgrade can quietly revert a setting to its default.
 
-### Certificate rotation
+**Orphaned configs.** The `owned-for-deletion` annotation handles cleanup. If a manifest lacked it,
+sweep with `kubectl get addonconfig -n <VSPHERE_NAMESPACE>` and delete configs whose cluster or addon no
+longer exists.
 
-Rotation is silent when it works, which makes it an untested assumption. Confirm at least once that
-it has run — check control-plane certificate expiry on a node and verify the dates advance after the
-renewal window passes. Then **alert on certificate expiry as a backstop**, so a silently broken
-rotation surfaces months before it becomes an outage.
+**Adding an addon** is a normal day-2 operation. Apply the `AddonInstall` and optional `AddonConfig`; no
+ordering to observe, no restart.
 
-### etcd growth
+**Monitoring worth having**, given what this profile is sensitive to:
 
-Scrape etcd with the Prometheus stack you already have and alert on database size at 60–70% of
-`maximumDBSizeGiB`. Watch the **trend**, not just the threshold: steady growth usually means
-excessive object churn, a controller writing status in a loop, or auto-compaction not running.
-Lowering `kubeControllerManagerConfiguration.terminatedPodGCThreshold` helps on high-churn clusters.
+| Alert | Reason |
+| --- | --- |
+| Allocated pod CIDR blocks against total | An exhausted CIDR blocks upgrades and cannot be fixed in place |
+| etcd database size above 60% of quota | Turns a read-only outage into a ticket |
+| Node clock skew | Otherwise near-undiagnosable OIDC failures |
+| Control-plane certificate expiry | Backstop for a silently broken rotation |
+| containerd and kubelet volume fill | Those volumes are the node's protection |
+| Pods per node approaching `maxPods` | Early warning before scheduling failures |
+| PVC pending duration | Catches the storage-class association problem |
+| istiod and gateway availability | Both default to a single replica in the profile |
+| Failed authentication rate | Detects misconfiguration and credential attacks |
+| `PackageInstall` reconcile failures | The authoritative signal that an addon stopped converging |
 
-### Tightening Pod Security
+**Identity hygiene.** Plan client secret rotation, and prefer a Secret reference so rotating does not
+mean editing a manifest. Audit RBAC bindings against current staff, which is the argument for
+group-based bindings once your provider emits groups.
 
-A planned migration, with step 1 completely risk-free. Full sequence in
-[7.7.3](#773-securitypodsecuritystandard). Raise `audit` and `warn` to `restricted` today, leave
-`enforce` alone, and you get the full inventory of what would break at zero risk. Use
-`exemptions.namespaces` only for platform components that cannot run enforced at any level, and
-per-namespace PSA labels — not exemptions — for workload namespaces that need a lower level.
+**If the UI address changes**, four things move together or login breaks: the Headlamp `hostname`, the
+`callbackURL`, the DNS record, and the redirect URI registered at your provider. Reserving a static
+LoadBalancer IP removes the trigger; [Appendix C.3](#c3-dns-automation-external-dns) automates the DNS
+step.
 
-### OIDC and hostname changes
+**Backups** are not part of this profile. Whether they belong in-cluster depends on how you already
+protect workloads, since many environments handle it at the vSphere or storage layer.
+[Appendix C.1](#c1-backup-and-restore-velero) covers the in-cluster option. Either way, test a restore.
+Keep these manifests in version control regardless: they are the declarative source of truth, and for
+the immutable fields in [1.3](#13-decisions-you-cannot-revisit) rebuilding from them is the only remedy.
 
-If the Gateway IP or FQDN changes, four things must move together or login breaks:
+### 9.4 Symptom lookup
 
-1. Headlamp `hostname`
-2. Headlamp `callbackURL`
-3. The DNS record
-4. The authorized redirect URI registered with the identity provider
+Most of these present at a different layer than their cause, so recognising the symptom saves the
+search.
 
-Reserving a static LoadBalancer IP removes the trigger entirely. Automating step (3) is possible —
-see [Appendix D.3](#d3-dns-automation-external-dns).
-
-Also review periodically:
-
-- **IdP client secret rotation** — plan it, and prefer a Secret reference so rotation does not mean
-  editing a manifest.
-- **RBAC drift** — audit bindings against current staff. This is the argument for group-based
-  bindings once your IdP emits groups.
-
-### Backup and restore
-
-Not part of the base manifest, and whether it belongs in-cluster depends on how you already protect
-workloads — many environments handle this at the vSphere or storage layer instead. If you do want it
-in-cluster, see [Appendix D.1](#d1-backup-and-restore-velero). Either way, **test a restore**: an
-untested backup is a hypothesis.
-
-Independently of any backup tooling, keep these manifests in version control. They are the declarative source of truth for the
-cluster, and rebuilding from them is often faster than repairing — which matters for the immutable
-fields in [section 8](#8-cluster-decisions-you-cannot-change-later), where rebuild is the only remedy.
+| Symptom | Likely cause | Read |
+| --- | --- | --- |
+| Addon deployed but your values had no effect | `AddonConfig` name did not resolve, so it was skipped | [4](#the-naming-rule) |
+| Addon never appears at all | `AddonInstall` selector matches nothing | [6](#6-the-addon-stack) |
+| Nodes `Ready` but pods stay `Pending` | Pod CIDR blocks exhausted | [7.1](#71-pod-and-service-networking) |
+| Rolling upgrade stalls in a mixed-version state | No free pod CIDR block for the surge node | [7.1](#71-pod-and-service-networking) |
+| Machines never provision | OS image selector, VM class, or storage policy not available to the namespace | [1.2](#12-platform-prerequisites), [7.4](#74-control-plane) |
+| PVCs pend indefinitely | StorageClass not associated with the vSphere Namespace | [7.8](#78-platform-settings) |
+| Intermittent, user-specific auth failures that resolve on retry | Clock skew against token `exp` and `iat` | [7.8](#78-platform-settings) |
+| Login succeeds, every API call is unauthorised | Client ID missing from the API server `audiences` | [7.7](#77-identity-oidc-and-rbac) |
+| Login succeeds, user has no permissions | No RBAC binding for the mapped username | [7.7](#77-identity-oidc-and-rbac) |
+| All tokens rejected as untrusted issuer | `issuer.url` mismatch, or an untrusted provider CA | [7.7](#77-identity-oidc-and-rbac) |
+| Group-based bindings never apply | Provider emits no `groups` claim | [7.7](#77-identity-oidc-and-rbac) |
+| Provider shows a redirect-mismatch error | `callbackURL`, DNS, and registered redirect URI disagree | [6.5](#65-headlamp) |
+| UI pods healthy, URL unreachable | `Gateway` unprogrammed, no matching controller | [6.5](#65-headlamp) |
+| Monitoring deployed, no metrics and no alerts | No `Prometheus` CR, so the operator is idle | [6.3](#63-prometheus) |
+| Cluster-wide write failures, reads fine | etcd hit its size quota and went read-only | [7.8](#78-platform-settings) |
+| Workloads rejected at admission after an upgrade | PSS versions pinned to `latest` tightened | [7.6](#76-pod-security) |
+| `helm install --create-namespace` rejected | Bare namespace inherits a stricter cluster default | [7.6](#76-pod-security) |
+| `NotReady` kubelets, etcd election churn, random timeouts | `best-effort` VM class under hypervisor contention | [7.3](#73-node-sizing) |
+| Nodes accept many pods then destabilise | `maxPods` raised without node resources or reservations | [7.3](#73-node-sizing) |
+| istiod replica count oscillates | Static `pilot.replicas` fighting its own HPA | [6.4](#64-istio) |
+| Node pool never scales | Static `replicas` set alongside autoscaler annotations | [7.5](#75-worker-pools) |
+| Topology never reconciles | `topology.version` is not a valid `kr` name | [2](#2-choosing-a-kubernetes-release) |
 
 ---
 
-## Appendix A — Production baseline manifest
+## Appendix A: A production starting point
 
-> **What this is.** The same stack, hardened and copy-pasteable — the counterpart to
-> [`reference-profile.yaml`](./reference-profile.yaml).
->
-> **Why it matters.** It turns the recommendations scattered through sections 6–12 into a single
-> artifact you can start from, with a change table explaining every deviation from the reference
-> profile.
+The same stack, hardened. Substitute the placeholders, verify version strings and class names against
+your environment, and read the inline notes. A few settings depend on schema field names you should
+confirm with the discovery commands from [section 5](#5-reading-an-addons-value-schema) rather than
+trust here.
 
-A hardened version of the same stack. Substitute the placeholders, verify version strings and class
-names against your environment, and read the inline notes — a few settings depend on schema field
-names you should confirm with the discovery commands rather than trust from a document.
+These objects go to the vSphere Namespace on the Supervisor. The in-cluster companions are in
+[Appendix B](#appendix-b-in-cluster-companion-objects).
 
-**Scope:** these objects are applied to the **vSphere Namespace on the Supervisor**. Objects that
-belong *inside* the workload cluster are in
-[Appendix B](#appendix-b--additional-objects-and-hardening).
-
-**What changed, and why:**
-
-| Change | Reason |
-| --- | --- |
-| Pod CIDR `/20` → `/16` | `/20` gives only 16 per-node blocks; a 3 + 10 node shape plus surge nearly exhausts it, and an exhausted CIDR blocks upgrades. Immutable. |
-| `controlPlane.replicas` 1 → 3 | etcd quorum; upgrades stop being outages |
-| `best-effort-*` → `guaranteed-*` | Reserved resources; removes contention-induced instability that presents as Kubernetes flakiness |
-| Control plane → `guaranteed-large` | etcd is latency-sensitive and intolerant of starvation |
-| PSS `privileged` → `enforce: baseline`, `audit`/`warn: restricted` | Real admission control, plus a zero-risk inventory of the path to `restricted` |
-| PSS versions `latest` → `v1.36` | Upgrades no longer change admission policy silently |
-| Added `podSecurityStandard.exemptions` | Narrow, explicit exceptions instead of a weakened cluster default |
-| Added `kubeletConfiguration` log bounds and `podPidsLimit` | Protects the kubelet volume; limits fork-bomb exposure |
-| Added `resourceConfiguration.systemReserved` | Explicitly protects system daemons |
-| Added `node.labels` | Declarative labels survive node replacement; hand-applied labels do not |
-| Added `kubernetes.endpointFQDNs` | API server reachable by a stable name in the same domain as the UI |
-| `maxPods` set explicitly | Explicit beats implicit, and documents the density decision |
-| `volumes` 30Gi → 100Gi | Resizing later is a rolling node replacement |
-| `etcdConfiguration` 4 → 8 GiB | Headroom for a CRD- and event-heavy addon stack |
-| `orValue(true)` → `orValue(false)` | The claim validation rule now fails closed |
-| `clientSecret` inline → secret reference | Keeps the credential out of etcd and Git |
-| `pilot`: static `replicas` removed, `minReplicas` → 2 | No HPA conflict; istiod no longer a single point of failure |
-| Ingress `minReplicas` 1 → 2 | Survives a reschedule without an ingress outage |
-| `accessLogFile` `""` → `/dev/stdout` | Restores L7 debugging at the gateway |
-| `prometheus` operator + explicit `Prometheus` CR (Appendix B.3) | Rule evaluation actually exists |
-| Worker `min-size` 1 → 3 | Capacity redundancy |
-| `priorityClassName` `""` → `system-cluster-critical` | The Helm controllers stop being evictable |
-| `meshID` cluster name → mesh name | Leaves multi-cluster federation available |
+[Section 1.4](#14-what-to-change-before-production) lists what changed and why. Two further changes
+not on that list: `priorityClassName` on the Helm controllers, and `meshID` naming the mesh rather than
+the cluster so multi-cluster federation stays available.
 
 ```yaml
-# =============================================================================
-#  Addons. Order is irrelevant — all are reconciled independently.
-# =============================================================================
+# Addons. Order is irrelevant; all reconcile independently.
 apiVersion: addons.kubernetes.vmware.com/v1alpha1
 kind: AddonInstall
 metadata:
@@ -3020,14 +2090,13 @@ kind: AddonConfig
 metadata:
   annotations:
     clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
-  # Name contract: <clusterName>-<addonRef.name>. Set spec.clusterName and
-  # spec.addonConfigDefinitionRef explicitly if you generate these manifests —
-  # it removes the silent-skip failure mode and pins the addon release.
+  # In generated manifests, set spec.clusterName and spec.addonConfigDefinitionRef
+  # explicitly instead of relying on this name. It removes the silent-skip failure
+  # mode and pins the addon release.
   name: workload-vsphere-vks2-helm-controller
   namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
-    # These reconcile your own HelmReleases. Do not leave them evictable.
     helmController:
       priorityClassName: system-cluster-critical
     sourceController:
@@ -3073,9 +2142,8 @@ spec:
       kube-state-metrics: true
       node-exporter: true
       pushgateway: false
-      # Operator-managed: you declare the Prometheus CR yourself (Appendix B.3),
-      # which gives you control over retention, storage, and scrape config.
-      # NOTHING SCRAPES until that CR exists.
+      # Operator-managed. NOTHING SCRAPES until you create the Prometheus CR
+      # in Appendix B.3.
       prometheus: false
       alertmanager: true          # configure receivers, or alerts go nowhere
       prometheus-operator: true
@@ -3104,12 +2172,10 @@ spec:
   values:
     istio:
       namespace: "istio-system"
-      # Deployed for L4/L7 ingress only — no service mesh, no sidecar injection.
+      # L4/L7 ingress only. If you later label namespaces for sidecar
+      # injection, set istioCNI.enabled: true in the SAME change.
       ambientMode:
         enabled: false
-      # Not required without sidecar injection, so it imposes no Pod Security
-      # constraint here. If you later label namespaces for injection, set this
-      # to true AT THE SAME TIME or injected pods will need `privileged`.
       istioCNI:
         enabled: false
       gateways:
@@ -3118,18 +2184,17 @@ spec:
           namespace: istio-ingress
           autoscaling:
             enabled: true
-            minReplicas: 2        # 1 = ingress outage on every reschedule
+            minReplicas: 2
             maxReplicas: 5
       pilot:
-        # No static `replicas` — the HPA owns it. Setting both causes churn.
+        # No static replicas: the HPA owns the field.
         autoscaling:
           enabled: true
-          minReplicas: 2          # istiod programs all gateways; do not run one
+          minReplicas: 2
           maxReplicas: 4
       meshConfig:
-        accessLogFile: "/dev/stdout"   # your ingress request log
-        enableTracing: false           # true also needs a tracing provider
-        # Name the MESH, not the cluster — federation needs a shared meshID.
+        accessLogFile: "/dev/stdout"
+        enableTracing: false
         meshID: "prod-mesh"
 ---
 apiVersion: addons.kubernetes.vmware.com/v1alpha1
@@ -3154,43 +2219,31 @@ metadata:
   namespace: <VSPHERE_NAMESPACE>
 spec:
   values:
-    # A DNS name you control, published as an A record pointing at the Headlamp
-    # Gateway's own LoadBalancer IP (NOT the istio-ingress gateway's). Reserve
-    # that IP so this value is stable.
+    # Published in DNS, pointing at THIS Gateway's LoadBalancer. Reserve the IP.
     hostname: headlamp.k8s.example.com
     gatewayApi:
       enabled: true
       gateway:
-        # REQUIRES a gateway controller: the istio addon above, or contour.
-        # The Gateway API CRDs are platform-provided; a controller is not.
-        className: istio
+        className: istio          # requires the istio addon above, or contour
         create: true
         name: headlamp-gateway
-        # The addon creates a cert-manager Issuer + Certificate automatically,
-        # but SELF-SIGNED. Point this at a trusted-CA certificate for production
-        # (Appendix B.2); check your release's schema for the TLS field names.
+        # The addon issues a SELF-SIGNED certificate by default. Point this at
+        # a trusted-CA certificate (Appendix B.2); check the schema for the
+        # TLS field names.
     oidc:
       enabled: true
-      # Any OIDC-compliant provider. Must match the token's `iss` byte-for-byte.
       issuerURL: https://idp.example.com
-      # MUST equal the apiserver's extraAuthentication audience below, or users
-      # log in successfully and then get permission errors on every API call.
-      clientID: <OIDC_CLIENT_ID>
-      # DO NOT inline the secret. Reference a Kubernetes Secret — check your
-      # release's schema for the supported field (commonly `existingSecret` /
-      # `clientSecretRef`) and manage it with sealed-secrets, external-secrets,
-      # or the vault-injector addon so this file stays committable.
+      clientID: <OIDC_CLIENT_ID>          # must equal the apiserver audience
+      # Do not inline this. Check the schema for a secret-reference field and
+      # manage the Secret with sealed-secrets, external-secrets, or
+      # vault-injector so this file stays committable.
       clientSecret: <OIDC_CLIENT_SECRET>
-      # Must be registered as an authorized redirect URI with your IdP.
       callbackURL: https://headlamp.k8s.example.com/oidc-callback
       scopes:
       - openid
-      - email      # load-bearing: feeds the username claim mapping
+      - email                             # feeds the username claim mapping
       - profile
 ---
-# =============================================================================
-#  Cluster
-# =============================================================================
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
 metadata:
@@ -3200,17 +2253,14 @@ spec:
   clusterNetwork:
     pods:
       cidrBlocks:
-      # /16 = 256 per-node /24 blocks = 255 usable nodes after reserving one for
-      # upgrade surge. IMMUTABLE: the pool is carved into fixed /24 blocks per
-      # node, and every rolling replacement needs a FREE block for its surge
-      # node or it stalls. A /20 gives only 16 blocks total.
-      # Reserved 240/4 space avoids RFC1918 collisions — validate it against
-      # your CNI, firewalls, and load balancers first.
+      # 256 per-node /24 blocks, so 255 usable nodes after a surge reserve.
+      # IMMUTABLE. A /20 gives only 16 blocks, which the 3 + 10 shape below
+      # would nearly exhaust. Validate 240/4 against your firewalls and LBs.
       - 240.0.0.0/16
     serviceDomain: cluster.local
     services:
       cidrBlocks:
-      - 240.1.0.0/20                    # no overlap with the pod range above
+      - 240.1.0.0/20
   topology:
     classRef:
       name: builtin-generic-v3.7.0
@@ -3219,24 +2269,21 @@ spec:
       metadata:
         annotations:
           run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-      replicas: 3                       # etcd quorum; upgrades become rolling
+      replicas: 3
       variables:
         overrides:
         - name: vmClass
-          # Guaranteed, and larger than the workers: etcd under CPU contention
-          # causes leader-election churn that looks like cluster-wide instability.
           value: guaranteed-large
     variables:
     - name: storageClass
       value: <STORAGE_CLASS>
     - name: vmClass
-      # guaranteed-* reserves CPU and memory. best-effort-* is acceptable for
-      # dev/test only: it presents as Kubernetes flakiness, not resource pressure.
-      # Size this to your maxPods setting below.
+      # guaranteed-* reserves CPU and memory. best-effort-* is dev/test only:
+      # the symptoms point at Kubernetes, not at resource pressure.
       value: guaranteed-medium
     - name: volumes
-      # Resizing these later is a ROLLING NODE REPLACEMENT. Size generously now,
-      # and scale with pod density — a 250-pod node needs far more than a 110-pod one.
+      # Resizing these is a rolling node replacement. Size generously, and scale
+      # with pod density.
       value:
       - capacity: 100Gi
         mountPath: /var/lib/containerd
@@ -3249,204 +2296,161 @@ spec:
     - name: node
       value:
         # Declarative labels survive node replacement; hand-applied ones do not.
-        # Use per-pool overrides to differentiate pools (see 7.13).
         labels:
           workload-type: general
           environment: production
     - name: resourceConfiguration
       value:
         systemReserved:
-          # Protects kubelet, runtime, and OS from being starved by pods.
-          # `automatic` is correct at the default maxPods of 110 — it derives a
-          # tiered reservation from node size. If you raise maxPods, that tier
-          # does NOT grow with pod count, so override explicitly (add ~11 MiB
-          # per pod above 110, and ~400m CPU) AND move to a larger VM class.
-          # See 7.13 for the formulas, sources, and per-class arithmetic.
+          # Correct at maxPods 110, where the reservation is derived from node
+          # size. If you raise maxPods, override explicitly and move to a
+          # larger VM class: see 7.3.
           automatic: true
     - name: kubernetes
       value:
-        # FQDN aliases for the API server, in the same domain as the UI, so the
-        # whole cluster is reachable by name. Adds the name to the cert SANs;
-        # you still publish the DNS record yourself.
+        # API server FQDN aliases, in the same domain as the UI. Adds the name
+        # to the certificate SANs; you still publish the DNS record.
         endpointFQDNs:
         - api.k8s.example.com
         certificateRotation:
           enabled: true
           renewalDaysBeforeExpiry: 90
         etcdConfiguration:
-          # The etcd volume must actually have this space. Alert at 60-70%.
+          # The etcd volume must have this space. Alert at 60-70%.
           maximumDBSizeGiB: 8
         kubeControllerManagerConfiguration:
-          terminatedPodGCThreshold: 500   # bounds etcd growth on churn
+          terminatedPodGCThreshold: 500
         security:
-          # NOTE: minimumTLSProtocol and tlsCipherSuites are deliberately NOT set
-          # here. Raising the TLS floor or narrowing ciphers breaks clients,
-          # webhooks, and integrations that have not been validated against it,
-          # and the failures are hard to attribute. Change only against a
-          # specific compliance requirement, with a tested client inventory.
+          # minimumTLSProtocol and tlsCipherSuites are deliberately NOT set.
+          # Raising the TLS floor or narrowing ciphers breaks unvalidated
+          # clients and webhooks, and the failures are hard to attribute.
           podSecurityStandard:
-            # enforce=baseline blocks known privilege escalations.
-            # audit/warn=restricted inventories the path to `restricted`
-            # WITHOUT rejecting anything — risk-free reconnaissance.
+            # baseline blocks real privilege escalation while most application
+            # charts still install unmodified. restricted is a per-NAMESPACE
+            # goal you raise deliberately, via namespace labels.
             enforce: baseline
             enforceVersion: v1.36
+            # Stricter audit/warn inventories the path to restricted without
+            # rejecting anything.
             audit: restricted
             auditVersion: v1.36
             warn: restricted
             warnVersion: v1.36
             deactivated: false
-            # `baseline` is the pragmatic cluster default: it blocks real
-            # privilege escalation while most application charts still install
-            # unmodified. `restricted` is a per-NAMESPACE goal you raise
-            # deliberately, via namespace labels — not a cluster-wide start.
-            #
-            # EXEMPTIONS DISABLE PSS ENTIRELY for the listed namespaces (no
-            # enforce, audit, OR warn). Use them only for platform components
-            # that cannot run enforced at any level. For workload namespaces
-            # that need a LOWER level, use namespace labels instead — see 7.7.3.
-            # Verify these names against your own cluster.
+            # Exemptions DISABLE Pod Security entirely for these namespaces.
+            # Use them only for platform components that cannot run enforced at
+            # any level; for workload namespaces use labels instead.
             exemptions:
               namespaces:
-              - tanzu-system-monitoring     # node-exporter needs host access
-              - vmware-system-antrea        # CNI agent
+              - tanzu-system-monitoring
+              - vmware-system-antrea
           resourceQuotaConfiguration:
             enabled: true
         apiServerConfiguration:
           logs:
             format: json
-          # Generic OIDC — any compliant provider. Supports human login via
-          # Headlamp and OIDC-aware kubectl plugins.
           extraAuthentication:
             jwt:
             - issuer:
                 url: https://idp.example.com
                 audiences:
                 - <OIDC_CLIENT_ID>
-                # For an internal IdP behind an enterprise or self-signed CA,
-                # supply the CA bundle here or every token fails validation:
-                # certificateAuthority: |
-                #   -----BEGIN CERTIFICATE-----
-                #   ...
-                # And select the network path the apiserver uses to reach it:
-                # egressSelectorType: cluster
+                # For an internal provider behind a private CA, also set:
+                #   certificateAuthority: | ...
+                #   egressSelectorType: cluster
               claimMappings:
                 username:
                   claim: email
-                  # NEVER empty: prevents an external identity impersonating
-                  # system: subjects. Changing it orphans ALL RBAC bindings.
+                  # Never empty. Changing it orphans every RBAC binding.
                   prefix: "oidc:"
                 groups:
-                  # VERIFY your IdP actually emits this claim — many do not by
-                  # default. Inspect a real token before designing group RBAC.
+                  # Verify your provider actually emits this claim.
                   claim: groups
                   prefix: "oidc-groups:"
               claimValidationRules:
-              # orValue(FALSE) — fails closed. A token omitting email_verified
-              # is REJECTED. orValue(true) would silently accept it.
+              # orValue(false) fails closed: a token that omits the claim is
+              # rejected rather than admitted.
               - expression: 'claims.?email_verified.orValue(false) == true'
                 message: "email must be verified"
         kubeletConfiguration:
           logging:
             format: json
-          # Default 110; documented maximum 250. Raising it buys pod density
-          # WITHOUT consuming more pod CIDR blocks — but size the VM class and
-          # systemReserved to match, and stay under ~220 sustained on a /24.
-          # Changing this requires a machine rollout.
+          # Default 110, documented maximum 250. Raising it buys density without
+          # consuming pod CIDR blocks, but size the VM class and systemReserved
+          # to match. Changing it requires a machine rollout.
           maxPods: 110
-          podPidsLimit: 4096              # limits fork-bomb exposure
-          containerLogMaxSizeMiB: 50      # protects the kubelet volume
+          podPidsLimit: 4096
+          containerLogMaxSizeMiB: 50
           containerLogMaxFiles: 5
     - name: bootstrapAddons
       value:
         cniRef:
-          # Effectively immutable — changing the CNI means a new cluster.
-          # Alternatives in this catalogue: calico, cilium.
+          # Effectively immutable. Alternatives: calico, cilium.
           name: antrea
           namespace: vmware-system-vks-public
     - name: vsphereOptions
       value:
         persistentVolumes:
-          # Every class must be associated with the vSphere Namespace, or PVCs
-          # pend indefinitely long after the cluster looks healthy.
           availableStorageClasses:
           - <STORAGE_CLASS>
           defaultStorageClass: <STORAGE_CLASS>
     - name: osConfiguration
       value:
         ntp:
-          # A functional prerequisite: TLS validity windows, etcd leases, and
-          # OIDC exp/iat claims all depend on synchronised clocks. Use the same
-          # sources as vCenter and ESXi. Alert on skew.
+          # A functional prerequisite: TLS validity, etcd leases, and OIDC
+          # exp/iat all depend on synchronised clocks. Same sources as vCenter
+          # and ESXi. Alert on skew.
           servers:
           - ntp1.example.com
           - ntp2.example.com
         sshd:
           banner: '---AUTHORIZED ACCESS ONLY--- Use of this system is restricted to
             authorized users for authorized activities only. '
-    # Must be the NAME of a kr that is READY=True and COMPATIBLE=True.
-    # Note the TRIPLE dash. Verify with: kubectl get kr
+    # Must be the NAME of a kr that is READY and COMPATIBLE. Note the triple
+    # dash. Check with: kubectl get kr
     version: v1.36.1---vmware.4-vkr.5
     workers:
       machineDeployments:
       - class: node-pool
         metadata:
           annotations:
-            # The Cluster Autoscaler is installed by the platform, so these are
-            # effective. Do not also set `replicas` — they would fight.
+            # The platform installs the Cluster Autoscaler, so these are
+            # effective. Do not also set replicas.
             cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "3"
             cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "10"
             run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
         name: node-pool-1
 ```
 
-> **Node budget check for this manifest:** 3 control plane + 10 workers = 13 nodes, plus a surge
-> block = 14 blocks. On the `/16` above that is 14 of 256 — ample. On a `/20` it would be 14 of 16,
-> which is why the CIDR changed.
+Node budget check: 3 control plane plus 10 workers is 13 nodes, 14 blocks with the surge spare. On the
+`/16` above that is 14 of 256. On a `/20` it would be 14 of 16, which is why the CIDR changed.
 
 ---
 
-## Appendix B — Additional objects and hardening
+## Appendix B: In-cluster companion objects
 
-> **What this is.** The objects the reference profile is missing, applied **inside** the workload
-> cluster rather than to the vSphere Namespace.
->
-> **Why it matters.** Three gaps make the difference between a stack that runs and a stack that
-> works: OIDC without RBAC grants nothing, a self-signed certificate warns every user, and a
-> monitoring operator with no `Prometheus` CR collects nothing.
-
-The base manifest has three gaps: it authenticates without authorizing, it accepts a self-signed
-certificate for the UI, and it installs a monitoring operator without giving it anything to do.
-This appendix closes them.
-
-> **Context.** Unlike Appendix A, these objects are applied **inside the workload cluster**, not
-> to the vSphere Namespace. Switch your `kubectl` context first.
+Three things the reference profile is missing. All are applied inside the workload cluster, not to the
+vSphere Namespace, so switch context first.
 
 ### B.1 RBAC for OIDC identities
 
-The most important addition. Without it, OIDC login succeeds and grants nothing — the UI looks
-broken.
-
-The subject name is the **fully composed username**: the `prefix` from
-`claimMappings.username.prefix` concatenated with the mapped claim value.
+The most important addition. Without it, OIDC login succeeds and grants nothing.
 
 ```yaml
-# Applied INSIDE the workload cluster.
-# subjects[].name = claimMappings.username.prefix + the mapped claim value.
+# Apply in the workload cluster context, not the vSphere Namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: oidc-platform-admins
 subjects:
 - kind: User
-  name: "oidc:platform-admin@example.com"     # note the "oidc:" prefix
+  name: "oidc:platform-admin@example.com"     # prefix plus the mapped claim
   apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
   name: cluster-admin
   apiGroup: rbac.authorization.k8s.io
 ---
-# Least privilege for everyone else. Prefer namespace-scoped RoleBindings where
-# the role does not genuinely need cluster scope.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -3460,14 +2464,14 @@ roleRef:
   name: view
   apiGroup: rbac.authorization.k8s.io
 ---
-# Once your IdP emits a groups claim, bind groups instead of users.
+# Once your provider emits a groups claim, bind groups instead of users.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: oidc-group-platform-team
 subjects:
 - kind: Group
-  name: "oidc-groups:platform-team"           # groups prefix + group name
+  name: "oidc-groups:platform-team"
   apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
@@ -3475,25 +2479,24 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-| Guidance | Detail |
-| --- | --- |
-| **Get the prefix right** | `oidc:user@example.com`, not `user@example.com`. A binding without the prefix silently matches nobody. **Always verify with `kubectl auth whoami`** rather than assuming what the API server derived. |
-| **Bind groups once you can** | Per-user bindings do not scale and go stale as people join and leave. Groups are the correct unit — but confirm your IdP emits the claim first ([Pitfall 9](#9-the-idp-emits-no-groups-claim)). |
-| **Avoid `cluster-admin`** | Grant it to a small, named set of break-glass identities. Everyone else gets `view`, `edit`, or a purpose-built role. |
-| **You already have a fallback** | If the identity provider is unreachable, OIDC authentication fails — but this is **not** a lockout. VKS lets you regenerate a working kubeconfig through the Supervisor at any time: `vcf context create <name> --endpoint https://<supervisor> --type k8s`, then select the namespace and cluster. So there is no need to pre-stage and rotate a separate emergency credential. Do confirm your vSphere SSO account retains the namespace permissions to do this. |
-| **Audit periodically** | Bindings accumulate. Review them against current staff and roles. |
+Get the prefix right: `oidc:user@example.com`, not `user@example.com`. A binding without it matches
+nobody. Verify with `kubectl auth whoami` rather than assuming.
 
-### B.2 Trusted TLS for the Headlamp Gateway
+Prefer namespace-scoped `RoleBinding`s wherever the role does not genuinely need cluster scope, and
+grant `cluster-admin` to a small named set rather than a team. Per-user bindings do not scale and go
+stale as people join and leave, so move to groups once you can.
 
-The Headlamp addon creates a **self-signed** cert-manager `Issuer` and `Certificate` automatically,
-so you get HTTPS out of the box — with a browser warning. For production, issue from a trusted CA.
+Bindings accumulate. Review them periodically against current staff and roles.
 
-Check what you currently have:
+### B.2 A trusted certificate for the UI
+
+The Headlamp addon creates a self-signed cert-manager `Issuer` and `Certificate` automatically, so
+HTTPS works without configuration, with a browser warning. Check what you have:
 
 ```bash
+# Workload cluster context.
 kubectl get certificate,issuer -n headlamp
 
-# who issued the certificate currently in use
 JP='{.metadata.annotations.cert-manager\.io/issuer-kind}{"/"}'
 JP+='{.metadata.annotations.cert-manager\.io/issuer-name}'
 JP+='{"  CN="}{.metadata.annotations.cert-manager\.io/common-name}{"\n"}'
@@ -3501,12 +2504,14 @@ kubectl get secret <tls-secret> -n headlamp -o jsonpath="$JP"
 ```
 
 ```
-Issuer/headlamp-issuer  CN=Headlamp CA      ← self-signed, hence the browser warning
+Issuer/headlamp-issuer  CN=Headlamp CA
 ```
 
-#### Option 1 — ACME (best when the FQDN is publicly resolvable)
+If the FQDN is publicly resolvable, an ACME issuer is usually less work overall, because it avoids
+distributing a CA certificate to client trust stores:
 
 ```yaml
+# Apply in the workload cluster context, not the vSphere Namespace.
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -3524,11 +2529,12 @@ spec:
         cnameStrategy: Follow
 ```
 
-#### Option 2 — Your enterprise CA (typical for internal clusters)
+For an internal cluster, issue from your enterprise PKI instead:
 
 ```yaml
-# The CA's signing keypair, created out-of-band from your PKI.
-# kubectl create secret tls enterprise-ca --cert=ca.crt --key=ca.key -n cert-manager
+# Apply in the workload cluster context, not the vSphere Namespace.
+# Create the CA keypair out-of-band from your PKI:
+#   kubectl create secret tls enterprise-ca --cert=ca.crt --key=ca.key -n cert-manager
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -3545,7 +2551,7 @@ metadata:
 spec:
   secretName: headlamp-tls
   dnsNames:
-  - headlamp.k8s.example.com        # must equal Headlamp's `hostname`
+  - headlamp.k8s.example.com        # must equal Headlamp's hostname
   duration: 2160h                   # 90 days
   renewBefore: 360h                 # 15 days
   privateKey:
@@ -3557,20 +2563,21 @@ spec:
     group: cert-manager.io
 ```
 
-Then reference the resulting secret from the Gateway's TLS listener — through `AddonConfig` values
-(check the schema for field names), or set `gateway.create: false` and manage the `Gateway` yourself.
+Then reference the resulting secret from the Gateway's TLS listener, through `AddonConfig` values or by
+setting `gateway.create: false` and managing the `Gateway` yourself.
 
-| Guidance | Detail |
-| --- | --- |
-| Secret namespace | A `Gateway` can normally only read TLS secrets in its own namespace. Cross-namespace references need an explicit `ReferenceGrant`. |
-| Private CA cost | A private CA means distributing the CA certificate to client trust stores. ACME avoids that entirely if the name is publicly resolvable. |
-| **Test the chain** | `openssl s_client -connect headlamp.k8s.example.com:443` before assuming the OIDC redirect flow works. A broken chain breaks login, not just the padlock. |
+A `Gateway` can normally only read TLS secrets in its own namespace, which is why the `Certificate`
+above targets `istio-ingress`; cross-namespace references need an explicit `ReferenceGrant`. Test the
+chain with `openssl s_client` before assuming the OIDC redirect flow works, because a broken chain
+breaks login rather than just the padlock.
 
-### B.3 A `Prometheus` instance via the operator
+### B.3 A Prometheus instance
 
-This is the piece that makes the monitoring stack functional. Adjust to your operator version.
+This is what makes the monitoring stack functional. Adjust to your operator version; it needs a
+ServiceAccount with cluster-wide read access, which the operator's own RBAC usually provides.
 
 ```yaml
+# Apply in the workload cluster context, not the vSphere Namespace.
 apiVersion: monitoring.coreos.com/v1
 kind: Prometheus
 metadata:
@@ -3579,8 +2586,8 @@ metadata:
 spec:
   replicas: 2
   retention: 30d
-  serviceAccountName: prometheus     # the operator's RBAC normally provides this
-  # Empty selectors discover every ServiceMonitor / PodMonitor / rule in the
+  serviceAccountName: prometheus
+  # Empty selectors discover every ServiceMonitor, PodMonitor, and rule in the
   # cluster. Narrow them if you want explicit opt-in.
   serviceMonitorSelector: {}
   podMonitorSelector: {}
@@ -3590,8 +2597,7 @@ spec:
     - namespace: tanzu-system-monitoring
       name: alertmanager
       port: web
-  # Without persistent storage you lose all metrics on every pod restart —
-  # a common and entirely avoidable surprise.
+  # Without persistent storage you lose all metrics on every pod restart.
   storage:
     volumeClaimTemplate:
       spec:
@@ -3602,208 +2608,103 @@ spec:
             storage: 100Gi
 ```
 
-**Alerts this cluster specifically needs**, derived from the pitfalls above:
+[Section 9.3](#93-ongoing-maintenance) lists the alerts worth defining for this particular stack.
 
-| Alert | Why |
-| --- | --- |
-| **Allocated pod CIDR blocks vs. total** | Alert *before* the last block is taken. An exhausted CIDR blocks upgrades and the CIDR is immutable ([Pitfall 4](#4-pod-cidr-exhaustion-blocks-upgrades)) |
-| etcd DB size > 60% of `maximumDBSizeGiB` | Turns [Pitfall 14](#14-etcd-read-only-after-exceeding-its-quota) from an outage into a ticket |
-| Node clock skew | [Pitfall 13](#13-clock-skew-breaks-oidc-intermittently) — otherwise close to undiagnosable |
-| Control-plane certificate expiry | Backstop for silently broken rotation |
-| containerd / kubelet volume fill % | Those volumes are your protection; know before they fill |
-| Pods-per-node approaching `maxPods` | Early warning before scheduling failures |
-| PVC pending duration | Catches the storage-class association problem ([Pitfall 11](#11-storageclass-or-vm-class-not-associated-with-the-vsphere-namespace)) |
-| istiod and gateway availability | Both default to `minReplicas: 1` in the sample |
-| Failed authentication rate | Detects both misconfiguration and credential attacks |
-| `PackageInstall` reconcile failures | The authoritative signal that an addon has stopped converging |
-
-### B.4 Further hardening worth considering
+### B.4 Worth adding beyond this
 
 | Area | Recommendation |
 | --- | --- |
-| **NetworkPolicy** | **The highest-value control missing from this stack.** A default-deny posture per namespace, using Kubernetes NetworkPolicy or your CNI's richer CRDs. The manifest has none, so any pod can reach any other. |
-| **PodDisruptionBudgets** | Required for safe rolling operations. Without them, an upgrade can take all replicas of a service down at once. |
-| **Backups, log shipping, DNS automation** | See [Appendix D](#appendix-d--optional-integrations-requiring-environment-specific-setup) — each needs an environment-specific decision before it does anything. |
-| **Secrets management** | Externalise every credential (`vault-injector`, sealed-secrets, external-secrets). Consider etcd encryption at rest. |
-| **GitOps** | These manifests are the source of truth. Reconcile from Git with review rather than applying by hand. |
-| **Audit logging** | Ship API server audit logs off-cluster. With OIDC in place they become a genuine record of who did what. |
-| **Istio mTLS** | If you later adopt the mesh, enable strict mTLS and a minimum TLS protocol version — and `istioCNI` at the same time. |
-| **Labels** | Ownership, environment, and cost-attribution labels on the `Cluster`. Trivial now, invaluable at fleet scale. |
+| NetworkPolicy | The highest-value control missing from the profile. Default-deny per namespace, using Kubernetes NetworkPolicy or your CNI's richer CRDs. As it stands any pod can reach any other. |
+| PodDisruptionBudgets | Required for safe rolling operations. Without them an upgrade can take all replicas of a service down at once. |
+| Secrets management | Externalise every credential with `vault-injector`, sealed-secrets, or external-secrets. Consider etcd encryption at rest. |
+| GitOps | These manifests are the source of truth. Reconcile from Git with review rather than applying by hand. |
+| Audit logging | Ship API server audit logs off-cluster. With OIDC in place they become a real record of who did what. |
+| Istio mTLS | If you adopt the mesh, enable strict mTLS and a minimum TLS protocol version, and `istioCNI` in the same change. |
+| Cluster labels | Ownership, environment, and cost-attribution labels. Trivial now, invaluable at fleet scale. |
 
 ---
 
-## Appendix C — Verify for your environment
+## Appendix C: Integrations that need an external system
 
-> **What this is.** The claims this document deliberately does **not** assert, and the ones it
-> confirmed by direct inspection.
->
-> **Why it matters.** Addon defaults, schema field names, and platform behaviour move between
-> releases. Listing what to re-check — rather than asserting it and going stale — is what keeps the
-> rest of the document trustworthy.
+Backup, log forwarding, and DNS automation come up in almost every production conversation, and all
+three are useful. None of them does anything on its own. Each needs a decision about an external system
+that differs in every environment, which is why they are here rather than in the recommended baseline:
+installing one without the integration behind it leaves you with a running pod and false confidence.
 
-This document asserts only what was verified against a live VKS 3.7 environment, or what follows
-from stable Kubernetes behaviour. The items below are **environment- or release-specific and
-deliberately not asserted.**
+### C.1 Backup and restore (`velero`)
 
-| # | Item | How to check |
-| --- | --- | --- |
-| 1 | **Addon default values.** No specific addon default is stated anywhere in this document, because defaults move between releases. | `vcf addon available-releases get <release> -o output.yaml`, or `kubectl get acd <release> -n vmware-system-vks-public -o yaml`. Repeat after every addon upgrade. |
-| 2 | **Your ClusterClass variable set.** The ten variables described here are `builtin-generic-v3.7.0`'s. | `kubectl get clusterclass <name> -n vmware-system-vks-public -o jsonpath='{range .status.variables[*]}{.name}{"\n"}{end}'` |
-| 3 | **Exact semantics of `resourceQuotaConfiguration.enabled`** — which quota objects are created and how they relate to vSphere Namespace limits. | Test in non-production; check your VKS documentation. |
-| 4 | **Headlamp secret-reference and Gateway TLS field names** — needed to externalise `clientSecret` and use a trusted CA. | Headlamp addon schema output. |
-| 5 | **Istio strict-mTLS and resource field names**, referenced in B.4 without asserting spellings. | Istio addon schema output. |
-| 6 | **The `maxSurge` your ClusterClass rollout strategy applies.** This document assumes the Cluster API default of 1, which sets your minimum spare-block reserve. | ClusterClass and `MachineDeployment` rollout strategy. |
-| 7 | **Whether the per-node pod CIDR mask is tunable.** This document assumes the IPv4 default of `/24`, confirmed on live nodes. A `/25` would double your block count but is a create-time decision. | `kubectl get nodes -o custom-columns='NODE:.metadata.name,POD_CIDR:.spec.podCIDR'` and the ClusterClass schema. |
-| 8 | **API server behaviour when a mapped `groups` claim is absent** from the token — tolerated, or does it reject? | Test with a real token and read the result from `kubectl auth whoami`. |
-| 9 | **Whether `240.0.0.0/4` is handled correctly** by every appliance in your path — firewalls, hardware load balancers, monitoring. Antrea supports it; your wider environment may not. | Test pod-to-external and external-to-service traffic end to end before standardising. |
-| 10 | **Addon licensing and entitlement.** Some addons imply other products — `ako` requires NSX Advanced Load Balancer, for example. Availability in the catalogue is not entitlement. | Your licensing, and `vcf addon available list` for what your environment actually offers. |
-| 11 | **Custom VM classes.** Environments often define their own; the `best-effort`/`guaranteed` naming convention may not apply, so confirm whether a custom class reserves resources. | `kubectl get virtualmachineclass` and vCenter. |
-| 12 | **PSS version strings valid for your Kubernetes minor.** This document uses `v1.36` to match `v1.36.1`. | Kubernetes documentation for your minor version. |
-| 13 | **Practical `maxPods` ceiling for your node sizes.** The schema documents 250 as the maximum; what your VM classes can actually sustain is a capacity question. | Load-test at your intended density before standardising. |
+Backs up Kubernetes resources and persistent volumes, restores them, and supports migration between
+clusters.
 
-**Answered by direct inspection.** These are commonly asked, and each can be confirmed in your own
-environment with the command shown:
+Cluster-level backup is not a universal practice. Many environments protect workloads at a different
+layer, with vSphere-level VM protection, storage array snapshots, or application-native backup, and a
+database's own dump and WAL shipping is usually better than a volume snapshot of the same database.
+Whether an in-cluster tool adds anything depends on what you already have.
 
-| Question | Answer | Verified by |
-| --- | --- | --- |
-| Are the Gateway API CRDs installed automatically? | **Yes** — the `gateway-api` addon is platform-installed | `kubectl get clusteraddon -n <ns>` |
-| Is the Cluster Autoscaler deployed by default? | **Yes** — so the machine-deployment annotations are effective | `kubectl get clusteraddon -n <ns>` |
-| Are addons delivered as Helm releases? | **No** — Carvel `PackageInstall` objects | `kubectl get pkgi -A`; `kubectl get helmrelease -A` returns nothing |
-| Is there an addon ordering requirement? | **No** — all reconciled independently | Addon framework design |
-| What happens if an `AddonConfig` name does not resolve? | It **skips reconciliation**; `spec.clusterName` stays empty | `kubectl explain addonconfig.spec` |
-| `maxPods` default and maximum? | Default **110**, documented maximum **250**, minimum 20 | ClusterClass schema |
-| Does the Headlamp addon use cert-manager? | **Yes** — it creates a self-signed `Issuer` and `Certificate` | `kubectl get certificate,issuer -n headlamp` |
-| Does the Headlamp Gateway share the Istio ingress IP? | **No** — it provisions its own LoadBalancer | `kubectl get svc -n headlamp` |
+| Decision | Notes |
+| --- | --- |
+| Object storage target | Velero needs an S3-compatible bucket and credentials. No bucket, no backup. |
+| Scope | Cluster resources only, or volumes too? Volume backup needs a snapshot mechanism, and behaviour differs by CSI driver. |
+| Overlap with existing protection | If your storage layer already snapshots these volumes on a schedule you trust, this may be duplicate cost and complexity. |
+| Retention and schedule | Backups never expired become an unbounded storage bill. |
+| Restore target | Same cluster, or a rebuild? Cross-cluster restore has extra constraints around CIDRs and storage classes. |
+
+Whatever you use, including nothing, test a restore. That applies equally to vSphere-level protection:
+confirm you can recover a workload, not just that a job reported success.
+
+### C.2 Log forwarding (`fluent-bit`)
+
+Collects container and node logs and forwards them.
+
+Fluent Bit is only as useful as its output plugin, and the output is entirely environment-specific:
+Splunk, Elasticsearch or OpenSearch, Loki, an OTLP collector, a cloud logging service, plain syslog.
+Each needs its own configuration, endpoint, credentials, and index conventions. There is no sensible
+default to recommend, and a Fluent Bit with no configured output is a DaemonSet taking a pod slot on
+every node and shipping nothing.
+
+| Decision | Notes |
+| --- | --- |
+| Output plugin and endpoint | The core decision; it determines the whole configuration. |
+| Credentials and TLS | Most outputs need auth. Manage it as a Secret, not inline. |
+| Scope | All container logs, or filtered? Node and systemd logs too? Unfiltered collection from a busy cluster generates surprising volume. |
+| Parsing | The API server and kubelet emit JSON in this profile, so those parse cleanly. Application logs are whatever your applications emit. |
+| Volume and cost | Log platforms usually bill on ingest. Estimate before turning it on cluster-wide. |
+| Retention | Where it is enforced and for how long, often a compliance question. |
+
+If you have no log pipeline at all, this is the most urgent of the three. Node logs are destroyed when
+a node is replaced, which happens on every upgrade and every `vmClass` or `volumes` change, so without
+forwarding, your diagnostic history lasts only as long as a node and the JSON log format provides no
+benefit.
+
+### C.3 DNS automation (`external-dns`)
+
+Watches `Service`, `Ingress`, and `Gateway` resources and creates or updates DNS records to match.
+
+It requires write access to a DNS provider: a provider integration, an API credential, and a delegated
+zone. That is an organisational decision as much as a technical one, since many teams will not grant a
+cluster write access to corporate DNS.
+
+| Decision | Notes |
+| --- | --- |
+| DNS provider | Each has its own provider configuration and credential type. |
+| Credential scope | The cluster gets write access to a zone. Scope it to a delegated subdomain, never the apex. |
+| Zone delegation | Cleanest model is delegating a subdomain to be cluster-managed and leaving the rest alone. |
+| Ownership | External-DNS tracks ownership with TXT records. Decide how it coexists with manually managed records so it does not fight your DNS team. |
+| Policy | `sync` deletes records when resources go away; `upsert-only` never deletes. Start with `upsert-only`. |
+
+What it solves here is the manual A record for the UI, and the drift when the LoadBalancer IP changes.
+A simpler alternative solves most of it: reserve a static IP with your load-balancer provider, and the
+record never needs updating. Do that first, and add automation only if you are publishing enough
+services for manual records to be a real burden.
 
 ---
 
-## Appendix D — Optional integrations requiring environment-specific setup
+## Appendix D: Reading a Kubernetes release object
 
-> **What this is.** Three addons — backup, log forwarding, and DNS automation — and the decisions each
-> one requires before it is worth installing.
->
-> **Why it matters.** All three are commonly recommended as production essentials. They are not
-> optional because they lack value; they are separated out because each depends on an external system
-> that differs in every environment, and installing one without that integration leaves you with a
-> running pod and false confidence.
-
-These three addons come up in almost every production conversation, and they are all genuinely
-useful — but **none of them does anything on its own.** Each needs a decision about an external
-system before it produces value, and that decision is different in every environment. That is why
-they are here rather than in the recommended baseline: installing them without the integration
-behind them leaves you with a running pod and a false sense of coverage.
-
-Take them if the corresponding gap is real for you and you know what you are pointing them at.
-
-### D.1 Backup and restore (`velero`)
-
-**What it does.** Backs up Kubernetes resources and persistent volumes, restores them, and supports
-migration between clusters.
-
-**Why it is not in the baseline.** Cluster-level backup is not a universal practice. Many
-environments protect workloads at a different layer — vSphere-level VM protection, storage array
-snapshots, or an application-native backup (a database's own dump and WAL shipping is usually better
-than a volume snapshot of the same database). Whether an in-cluster backup tool adds anything depends
-on what you already have.
-
-**What you must decide first:**
-
-| Decision | Notes |
-| --- | --- |
-| **Object storage target** | Velero needs an S3-compatible bucket, plus credentials. This is the hard prerequisite — no bucket, no backup. |
-| **What is in scope** | Cluster resources only, or volumes too? Volume backup needs a snapshot mechanism, and behaviour differs by CSI driver. |
-| **Whether it duplicates existing protection** | If your storage layer already snapshots these volumes on a schedule you trust, this may be redundant cost and complexity. |
-| **Retention and schedule** | Backups that are never expired become an unbounded storage bill. |
-| **Restore target** | Same cluster, or a rebuild? Cross-cluster restore has extra constraints around CIDRs and storage classes. |
-
-> **Whatever you use — including nothing — test a restore.** An untested backup is a hypothesis, not
-> a control. This applies equally to vSphere-level protection: confirm you can actually recover a
-> workload, not just that a job reported success. This matters most for the immutable fields in
-> [section 8](#8-cluster-decisions-you-cannot-change-later), where rebuild-and-restore is the only remedy.
-
-### D.2 Log forwarding (`fluent-bit`)
-
-**What it does.** Collects container and node logs and forwards them to a destination.
-
-**Why it is not in the baseline.** Fluent Bit is only as useful as its **output plugin**, and the
-output is entirely environment-specific — Splunk, Elasticsearch/OpenSearch, Loki, an OTLP collector,
-a cloud logging service, or plain syslog. Each needs its own configuration, endpoint, credentials,
-and index or stream conventions. There is no sensible default to recommend, and a Fluent Bit with no
-configured output is a DaemonSet consuming a pod slot on every node and shipping nothing.
-
-**What you must decide first:**
-
-| Decision | Notes |
-| --- | --- |
-| **Output plugin and endpoint** | The core decision. Determines the whole configuration. |
-| **Credentials and TLS** | Most outputs need auth. Manage it as a Secret, not inline. |
-| **What to collect** | All container logs, or filtered? Node and systemd logs too? Unfiltered collection from a busy cluster generates surprising volume. |
-| **Parsing** | You set `format: json` on the API server and kubelet ([7.7.5](#775-structured-logging)), so those parse cleanly — but application logs are whatever your applications emit. |
-| **Volume and cost** | Log platforms usually bill on ingest. Estimate before turning it on cluster-wide. |
-| **Retention** | Where retention is enforced, and for how long — often a compliance question. |
-
-> **The reason this pairs with the manifest:** you already set structured JSON logging on both the API
-> server and the kubelet, and **node logs are destroyed when a node is replaced** — which happens on
-> every upgrade, `vmClass` change, and `volumes` resize. Without forwarding, the JSON setting buys you
-> nothing and your diagnostic history has the lifespan of a node. If you have no log pipeline at all,
-> this is the more urgent of the three.
->
-> It is also what makes PSS `audit` violations durable
-> ([7.7.3](#773-securitypodsecuritystandard)) — those land in the API server audit log.
-
-### D.3 DNS automation (`external-dns`)
-
-**What it does.** Watches `Service`, `Ingress`, and `Gateway` resources and creates or updates DNS
-records to match.
-
-**Why it is not in the baseline.** It requires **write access to a DNS provider** — a specific
-provider integration, an API credential, and a delegated zone. That is an organisational decision as
-much as a technical one: many teams will not grant a cluster write access to corporate DNS, and in
-those environments a change request is the process, not an API call.
-
-**What you must decide first:**
-
-| Decision | Notes |
-| --- | --- |
-| **DNS provider** | Each has its own provider configuration and credential type. |
-| **Credential and blast radius** | The cluster gets write access to a DNS zone. Scope the credential to a delegated subdomain (e.g. `k8s.example.com`), never the apex zone. |
-| **Zone delegation** | Cleanest model: delegate a subdomain to be cluster-managed and leave the rest alone. |
-| **Ownership and conflicts** | External-DNS uses TXT records to track ownership. Decide how it coexists with manually managed records so it does not fight your DNS team. |
-| **Policy** | `sync` (delete records when resources go away) versus `upsert-only` (never delete). `upsert-only` is safer to start with. |
-
-> **What it solves in this manifest:** the Headlamp FQDN currently needs a manually maintained A
-> record pointing at the Gateway's LoadBalancer IP ([6.5](#65-headlamp)), and if that IP changes the
-> record, the `callbackURL`, and the IdP registration all drift
-> ([Pitfall 7](#7-hostname-dns-and-redirect-uri-drift)). Automating the record removes the most
-> commonly forgotten of those steps.
->
-> **A simpler alternative that solves most of it:** reserve a static IP with your load-balancer
-> provider. The IP then never changes, so the record never needs updating and the drift problem
-> disappears without granting anyone DNS write access. Do that first; add automation only if you are
-> publishing enough services for manual records to be a real burden.
-
----
-
-## Appendix E — Inspecting a Kubernetes release (`kr`)
-
-> **What this is.** What is actually inside a `kr` object: component versions, the version-pinned
-> platform addons, and the OS images it offers — plus a ready-made pre-upgrade diff.
->
-> **Why it matters.** A Kubernetes *patch* bump can carry a CNI upgrade and a kapp-controller minor
-> version bump. Reading the release before you upgrade turns that from a surprise into a plan. It is
-> also how you test a `resolve-os-image` annotation before it stalls a cluster.
-
-
-[Section 2](#2-choosing-a-kubernetes-release-the-kr-object) covers *which* release to pick. This
-appendix covers what is actually **inside** one, because the `kr` object is the authoritative
-manifest of everything a release ships — and reading it answers three questions you otherwise guess
-at:
-
-1. **Which OS images may I select?** — the valid values for your `resolve-os-image` annotation.
-2. **What component versions am I getting?** — etcd, CoreDNS, CNI, CSI, CPI.
-3. **What actually changes if I upgrade?** — a real diff, before you touch anything.
-
-The object has four keys:
+[Section 2](#2-choosing-a-kubernetes-release) covers which release to pick. This covers what is inside
+one, because the `kr` object is the authoritative manifest of everything a release ships. Reading it
+answers three questions you otherwise guess at: which OS images you may select, what component
+versions you are getting, and what actually changes if you upgrade.
 
 ```bash
 kubectl explain kr.spec
@@ -3827,11 +2728,9 @@ FIELDS:
     KubernetesRelease.
 ```
 
-### E.1 `.spec.kubernetes` — core control-plane components
+### D.1 Core components
 
 ```bash
-# Build the jsonpath across lines in a variable — a trailing backslash inside
-# single quotes is LITERAL, not a line continuation, so it must not be split.
 JP='{"kubernetes: "}{.spec.kubernetes.version}'
 JP+='{"\netcd:       "}{.spec.kubernetes.etcd.imageTag}'
 JP+='{"\ncoredns:    "}{.spec.kubernetes.coredns.imageTag}'
@@ -3849,28 +2748,26 @@ pause:      3.10.2
 repository: localhost:5000/vmware.io
 ```
 
-| Field | What it tells you |
-| --- | --- |
-| `version` | The semver form of the Kubernetes version. Note this is the `+` form — `topology.version` takes the object **`NAME`** with the triple dash instead ([section 2](#2-choosing-a-kubernetes-release-the-kr-object)). |
-| `etcd.imageTag` | **The etcd version, which is the single most important number here.** etcd carries its own upgrade constraints and behavioural changes, and it is your cluster's state store. |
-| `coredns.imageTag` | The CoreDNS version. Relevant if you have custom Corefile configuration or have hit DNS behaviour changes before. |
-| `pause.imageTag` | The sandbox/infra container image. Rarely interesting, but it confirms the CRI baseline. |
-| `imageRepository` | Where control-plane images are pulled from. `localhost:5000/vmware.io` indicates a node-local mirror rather than an external registry — useful to know when diagnosing image pulls, and reassuring for air-gapped environments. |
-| `_fips` suffixes | Present on the CoreDNS and etcd tags above even though this is a non-FIPS release, meaning those components are FIPS-validated builds regardless. Do not infer a release's overall FIPS posture from a component tag — use the `-fips` marker in the release **name**. |
+The etcd version is the number to look at, since etcd carries its own upgrade constraints and is your
+cluster's state store. CoreDNS matters if you have custom Corefile configuration. `imageRepository`
+pointing at `localhost:5000` indicates a node-local mirror rather than an external registry, which is
+useful when diagnosing image pulls and reassuring in air-gapped environments.
 
-> **Why read this before an upgrade:** the Kubernetes version is only part of what moves. Comparing
-> the deployed release against the target across two patch versions of the *same minor*:
->
-> | Component | `v1.36.1---vmware.4-vkr.5` | `v1.36.2---vmware.2-vkr.3` |
-> | --- | --- | --- |
-> | Kubernetes | `v1.36.1+vmware.4` | `v1.36.2+vmware.2` |
-> | **etcd** | `v3.6.11_vmware.3-fips` | **`v3.6.12_vmware.7-fips`** |
-> | CoreDNS | `v1.14.3_vmware.3-fips` | `v1.14.3_vmware.7-fips` (rebuild) |
->
-> A Kubernetes patch bump brought an **etcd patch upgrade** with it. That is worth knowing in
-> advance rather than discovering afterwards.
+One caution on reading these tags: `_fips` suffixes appear on CoreDNS and etcd above even though this
+is not a FIPS release, meaning those components are FIPS-validated builds regardless. Do not infer a
+release's overall posture from a component tag.
 
-### E.2 `.spec.bootstrapPackages` — the platform addons pinned to the release
+Comparing two patch releases of the same minor shows why this is worth doing before an upgrade:
+
+| Component | `v1.36.1---vmware.4-vkr.5` | `v1.36.2---vmware.2-vkr.3` |
+| --- | --- | --- |
+| Kubernetes | `v1.36.1+vmware.4` | `v1.36.2+vmware.2` |
+| etcd | `v3.6.11_vmware.3-fips` | `v3.6.12_vmware.7-fips` |
+| CoreDNS | `v1.14.3_vmware.3-fips` | `v1.14.3_vmware.7-fips` |
+
+A Kubernetes patch bump brought an etcd patch upgrade with it.
+
+### D.2 Bootstrap packages
 
 ```bash
 kubectl get kr v1.36.2---vmware.2-vkr.3 \
@@ -3890,37 +2787,30 @@ vsphere-cpi.tanzu.vmware.com.1.36.0+vmware.2-tkg.1
 vsphere-pv-csi.tanzu.vmware.com.3.8.0+vmware.3-tkg.1
 ```
 
-**This is the version-pinned list of the platform components from
-[section 3](#3-what-vks-installs-for-you)** — the things installed for you. Two useful observations:
+This is the version-pinned list of the platform components from
+[section 3](#3-what-the-platform-already-gives-you). Two things stand out. Both CNI options appear,
+pinned to the release, so `bootstrapAddons.cniRef` selects among them while the release determines the
+version; you do not choose a CNI version independently. And the Gateway API version is here, which is
+what makes `gatewayApi.enabled: true` work with no CRD installation on your part.
 
-- **Both CNI options appear here** (`antrea` and `calico`), pinned to the release. Your
-  `bootstrapAddons.cniRef` selects among them ([7.8](#78-bootstrapaddons--cni-selection)); the
-  release determines the *version* you get. So you do not choose a CNI version independently — it
-  comes with the Kubernetes release.
-- The Gateway API version is here too, which is what makes `gatewayApi.enabled: true` work for
-  Headlamp ([6.5](#65-headlamp)) with no CRD installation on your part.
+The reason to diff this before upgrading is that a Kubernetes patch release is not only a patch. Across
+the two v1.36 releases above, all ten packages changed:
 
-> **A Kubernetes "patch" release is not only a patch.** Diffing the two v1.36 releases above,
-> **all ten bootstrap packages changed:**
->
-> | Component | `vkr.5` → `vkr.3` | Significance |
-> | --- | --- | --- |
-> | **antrea** | `2.6.1+vmware.1` → **`2.6.2+vmware.1`** | **A CNI upgrade — your dataplane** |
-> | **kapp-controller** | `0.59.8+vmware.1` → **`0.60.4+vmware.3`** | **A minor bump in the component that reconciles every addon** |
-> | secretgen-controller | `0.20.1+vmware.3` → `0.21.1+vmware.4` | Minor bump |
-> | guest-cluster-auth-service | `1.4.7+vmware.1` → `1.4.8+vmware.1` | Patch — authentication path |
-> | pinniped | `0.46.0+vmware.1` → `0.46.0+vmware.8` | Rebuild — authentication path |
-> | vsphere-pv-csi | `3.8.0+vmware.2` → `3.8.0+vmware.3` | Rebuild — storage |
-> | vsphere-cpi | `1.36.0+vmware.1` → `1.36.0+vmware.2` | Rebuild — LoadBalancer services |
-> | gateway-api | `1.5.1+vmware.1` → `1.5.1+vmware.4` | Rebuild |
-> | metrics-server | `0.8.1+vmware.1` → `0.8.1+vmware.3` | Rebuild |
-> | calico | `3.31.5+vmware.1` → `3.31.5+vmware.3` | Rebuild |
->
-> A CNI upgrade and a kapp-controller minor version bump inside a Kubernetes patch release is exactly
-> the kind of scope you want to know about while planning, not while troubleshooting. **Run this diff
-> as a standard pre-upgrade step** — see [E.4](#e4-a-pre-upgrade-change-report).
+| Component | Change | Why it matters |
+| --- | --- | --- |
+| antrea | `2.6.1+vmware.1` to `2.6.2+vmware.1` | A CNI upgrade, so your dataplane |
+| kapp-controller | `0.59.8+vmware.1` to `0.60.4+vmware.3` | A minor bump in the component reconciling every addon |
+| secretgen-controller | `0.20.1+vmware.3` to `0.21.1+vmware.4` | Minor bump |
+| guest-cluster-auth-service | `1.4.7` to `1.4.8` | Authentication path |
+| pinniped | `0.46.0+vmware.1` to `0.46.0+vmware.8` | Rebuild, authentication path |
+| vsphere-pv-csi | `3.8.0+vmware.2` to `3.8.0+vmware.3` | Rebuild, storage |
+| vsphere-cpi | `1.36.0+vmware.1` to `1.36.0+vmware.2` | Rebuild, LoadBalancer services |
+| gateway-api, metrics-server, calico | Rebuilds | |
 
-### E.3 `.spec.osImages` and the `osimage` object
+A CNI upgrade and a kapp-controller minor bump inside a Kubernetes patch release is the kind of scope
+you want to know about while planning.
+
+### D.3 OS images
 
 ```bash
 kubectl get kr v1.36.2---vmware.2-vkr.3 \
@@ -3933,41 +2823,29 @@ vmi-5c9649f9fba751a8b
 vmi-a32066fa312b9ab5f
 ```
 
-Order is not significant — and the names are opaque hashes, which is why the next step matters.
-
-Opaque hashes on their own. Resolve them through the cluster-scoped **`OSImage`** object
-(`run.tanzu.vmware.com/v1alpha3`, short name `osimg`):
+Opaque hashes. Resolve them through the cluster-scoped `OSImage` object, short name `osimg`:
 
 ```bash
 for i in $(kubectl get kr v1.36.2---vmware.2-vkr.3 \
              -o jsonpath='{range .spec.osImages[*]}{.name}{" "}{end}'); do
-  kubectl get osimage "$i" -o jsonpath='{.metadata.name}{"  "}{.spec.os.name}/{.spec.os.version}{"  "}{.spec.os.arch}{"  "}{.spec.image.type}{"\n"}'
+  kubectl get osimage "$i" \
+    -o jsonpath='{.metadata.name}{"  "}{.spec.os.name}/{.spec.os.version}{"  "}{.spec.os.arch}{"  "}{.spec.image.type}{"\n"}'
 done
 ```
 
 ```
-vmi-a32066fa312b9ab5f  photon/5       amd64  cvmi
 vmi-3219b260b6bb7ccf7  ubuntu/22.04   amd64  cvmi
 vmi-5c9649f9fba751a8b  ubuntu/24.04   amd64  cvmi
+vmi-a32066fa312b9ab5f  photon/5       amd64  cvmi
 ```
 
-**This is the authoritative list of OS choices for that release.** In the environment this was
-verified against, every `READY` + `COMPATIBLE` release offers the same three — **photon 5,
-ubuntu 22.04, ubuntu 24.04, all amd64** — but that is an observation about one environment, not a
-guarantee. Check your own release rather than assuming a given OS is available.
+That is the authoritative list of OS choices for that release. In the environment used here, every
+`READY` and `COMPATIBLE` release offered the same three, but that is an observation about one
+environment rather than a guarantee.
 
-#### The key connection: `resolve-os-image` is a label selector
-
-The annotation in the manifest —
-
-```yaml
-          run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-```
-
-— is a **label selector matched against `OSImage` labels.** Inspect the labels and it becomes obvious:
+The connection to the manifest is that `resolve-os-image` is a label selector against these objects:
 
 ```bash
-# --show-labels appends a LABELS column; $NF isolates it (labels contain no spaces)
 kubectl get osimage vmi-5c9649f9fba751a8b --show-labels --no-headers \
   | awk '{print $NF}' | tr ',' '\n'
 ```
@@ -3989,53 +2867,38 @@ v1.36=
 v1=
 ```
 
-**So you can test your annotation before applying it**, which turns a stalled cluster into a
-five-second check:
+So you can test the annotation before applying it, which replaces a stalled cluster with a quick
+check:
 
 ```bash
-# Exactly what the annotation will resolve to for a given release
 kubectl get osimage \
   -l os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=v1.36.2---vmware.2-vkr.3
 ```
 
-```
-NAME                    K8S VERSION        OS NAME   OS VERSION   ARCH    TYPE
-vmi-5c9649f9fba751a8b   v1.36.2+vmware.2   ubuntu    24.04        amd64    cvmi
-```
+Exactly one match is what you want. Selectable labels are `os-name`, `os-version`, `os-arch`, and
+`os-type`; add `os-arch` if your environment ever carries mixed architectures. The empty-valued version
+labels allow selection by version prefix as well as exact release. `content-library` tells you which
+vSphere content library holds the image, which is where to look if an image is listed but unusable.
 
-**Exactly one match is what you want.** No match means the annotation will never resolve and machine
-creation stalls with a thin error surface — the failure mode flagged in
-[7.3](#73-control-plane) and [7.12](#712-workersmachinedeployments--the-node-pool).
+Two notes on the objects themselves. `cvmi` is a cluster-scoped `ClusterVirtualMachineImage` and `vmi`
+is the older namespaced `VirtualMachineImage`; current releases use `cvmi`, and in the environment here
+96 of 138 `OSImage` objects were legacy `vmi` belonging to non-compatible releases. `OSImage` has no
+`status`: it is a projection owned by a `ClusterVirtualMachineImage`, so check that owner if an image
+looks wrong.
 
-| Observation | Detail |
-| --- | --- |
-| **Selectable labels** | `os-name`, `os-version`, `os-arch`, `os-type`. Add `os-arch=amd64` if your environment ever carries mixed architectures. |
-| **Version-prefix labels** | The empty-valued `v1`, `v1.36`, `v1.36.2` labels allow selection by version prefix as well as by exact release. |
-| **`run.tanzu.vmware.com/tkr`** | Ties the image to its release. Use it to scope a query to one release, as above. |
-| **`content-library`** | The vSphere content library holding the image. If an image is listed but unusable, this is where to look — the library must be synced and available to the namespace. |
-| **`vmi` vs `cvmi`** | `cvmi` is a cluster-scoped `ClusterVirtualMachineImage`; `vmi` is the older namespaced `VirtualMachineImage`. Current releases use `cvmi`. In the verified environment, 42 of 138 `OSImage` objects were `cvmi` and 96 were legacy `vmi` — the `vmi` ones belong to old, non-compatible releases. |
-| **No `status`** | `OSImage` is spec and metadata only. It is a projection, owned by a `ClusterVirtualMachineImage` — check that owner if an image looks wrong. |
+On choosing: Ubuntu 24.04 is the current LTS with the longest support horizon and the sensible default.
+Ubuntu 22.04 is the previous LTS, worth choosing only for a specific compatibility reason since you
+start closer to end of support. Photon 5 is VMware's minimal purpose-built host OS, with a smaller
+footprint and attack surface but fewer familiar userspace tools if you need to debug on a node.
 
-#### Choosing the OS
+### D.4 A pre-upgrade change report
 
-| OS | Consideration |
-| --- | --- |
-| **ubuntu 24.04** | Current LTS with the longest support horizon. The sensible default for a new cluster, and what this document uses. |
-| **ubuntu 22.04** | Previous LTS. Choose it only for a specific compatibility reason — you are starting closer to end of support. |
-| **photon 5** | VMware's minimal, purpose-built host OS. Smaller footprint and attack surface; fewer familiar userspace tools if you need to debug on a node. |
-
-Whatever you choose, **set the same annotation on the control plane and every machine deployment**, or
-pools drift onto different images ([7.12](#712-workersmachinedeployments--the-node-pool)).
-
-### E.4 A pre-upgrade change report
-
-Combining the above into one pre-upgrade step. Run it against your current and target releases and
-read the output before scheduling anything:
+Run this against your current and target releases before scheduling anything.
 
 ```bash
 #!/usr/bin/env bash
 # usage: kr-diff.sh <current-kr> <target-kr>
-# Requires only kubectl and coreutils — no jq, no python.
+# Requires only kubectl and coreutils.
 set -u
 CUR="$1"; TGT="$2"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -4043,10 +2906,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 echo "### Core components"
 for k in "$CUR" "$TGT"; do
   echo "  $k"
-  kubectl get kr "$k" -o jsonpath='\
-{"    kubernetes: "}{.spec.kubernetes.version}\
-{"\n    etcd:       "}{.spec.kubernetes.etcd.imageTag}\
-{"\n    coredns:    "}{.spec.kubernetes.coredns.imageTag}{"\n"}'
+  kubectl get kr "$k" -o jsonpath='{"    kubernetes: "}{.spec.kubernetes.version}{"\n    etcd:       "}{.spec.kubernetes.etcd.imageTag}{"\n    coredns:    "}{.spec.kubernetes.coredns.imageTag}{"\n"}'
 done
 
 echo; echo "### Bootstrap package changes"
@@ -4064,27 +2924,27 @@ done
 
 echo; echo "### Does the current resolve-os-image annotation still resolve?"
 n=$(kubectl get osimage --no-headers \
-      -l "os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=$TGT" 2>/dev/null | wc -l)
+      -l "os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=$TGT" 2>/dev/null | wc -l | tr -d ' ')
 echo "  matches: $n (expect exactly 1)"
 ```
 
-**What to do with the output:**
+What to do with the output:
 
 | Finding | Action |
 | --- | --- |
-| etcd version changed | Review etcd release notes. Confirm `maximumDBSizeGiB` headroom ([7.7.2](#772-etcdconfiguration)) and that you can recover it if the upgrade goes badly. |
-| **CNI version changed** | The highest-attention item — it is your dataplane. Validate in non-production, and check for NetworkPolicy or CRD behaviour changes. |
-| **kapp-controller version changed** | It reconciles every addon. An addon that stops converging after an upgrade points here first (`kubectl get pkgi -A`). |
-| CPI / CSI version changed | Test a LoadBalancer service and a PVC after the upgrade ([Layer 6](#layer-6--storage)). |
-| Authentication components changed | Re-verify OIDC login end to end ([Layer 7](#layer-7--identity-what-username-does-the-api-server-see)). |
-| Your OS choice is absent from the target | Stop. Resolve this before upgrading, or machine creation will stall. |
-| Zero label matches | Fix the annotation before applying anything. |
+| etcd version changed | Review etcd release notes, confirm quota headroom, and confirm you can recover it if the upgrade goes badly |
+| CNI version changed | The highest-attention item, since it is your dataplane. Validate in non-production and check for NetworkPolicy or CRD behaviour changes. |
+| kapp-controller version changed | It reconciles every addon. An addon that stops converging afterwards points here first. |
+| CPI or CSI version changed | Test a LoadBalancer service and a PVC after the upgrade |
+| Authentication components changed | Re-verify OIDC login end to end |
+| Your OS choice absent from the target | Stop and resolve it, or machine creation will stall |
+| Zero label matches | Fix the annotation before applying anything |
 
-### E.5 Command reference
+### D.5 Command reference
 
 ```bash
 # Usable releases only
-kubectl get kr
+kubectl get kr --no-headers | awk '$3=="True" && $4=="True" {print $1}' | sort -V
 
 # Everything a release ships
 kubectl get kr <name> -o yaml
@@ -4098,95 +2958,54 @@ kubectl get kr <name> -o jsonpath='{.spec.kubernetes.version}{"  etcd "}{.spec.k
 # Version-pinned platform addons
 kubectl get kr <name> -o jsonpath='{range .spec.bootstrapPackages[*]}{.name}{"\n"}{end}'
 
-# OS image references (opaque) ...
+# OS image references, opaque
 kubectl get kr <name> -o jsonpath='{range .spec.osImages[*]}{.name}{"\n"}{end}'
 
-# ... resolved to OS name and version
-kubectl get osimage --show-labels -l run.tanzu.vmware.com/tkr=<name>
+# ...resolved to OS name and version
+kubectl get osimage -L os-name,os-version,os-arch -l run.tanzu.vmware.com/tkr=<name>
 
 # Test a resolve-os-image annotation before applying it
 kubectl get osimage -l os-name=ubuntu,os-version=24.04,run.tanzu.vmware.com/tkr=<name>
 
-# Every OS image in the environment, with the release each belongs to
-kubectl get osimage -L os-name,os-version,os-arch,run.tanzu.vmware.com/tkr
-
-# What the running cluster actually landed on
+# What the running cluster landed on
 kubectl get cluster <CLUSTER_NAME> -n <VSPHERE_NAMESPACE> \
-  -o custom-columns='NAME:.metadata.name,VERSION:.status.version'
+  -o custom-columns='NAME:.metadata.name,CLUSTERCLASS:.spec.topology.classRef.name,VERSION:.status.version'
 ```
 
 ---
 
-## Summary — the short list
+## Appendix E: Check these against your own environment
 
-> **What this is.** Everything actionable from the document, condensed: what to settle before you
-> apply, what to change before production, and which parts of the reference profile to keep as-is.
+Everything in this guide is either derivable from the reference profile, verified against a running
+VKS 3.7 environment, or stable Kubernetes behaviour. The items below are environment- or
+release-specific and deliberately not asserted.
 
+| Item | How to check |
+| --- | --- |
+| Addon default values. No specific default appears anywhere in this guide, because they move between releases. | `vcf addon available-releases get <release> -o output.yaml`, or `kubectl get acd <release> -n vmware-system-vks-public -o yaml`. Repeat after every addon upgrade. |
+| Your ClusterClass variable set. The ten described here are `builtin-generic-v3.7.0`'s. | `kubectl get clusterclass <name> -n vmware-system-vks-public -o jsonpath='{range .status.variables[*]}{.name}{"\n"}{end}'` |
+| Exact semantics of `resourceQuotaConfiguration.enabled`: which quota objects are created, and how they relate to vSphere Namespace limits. | Test in non-production; check your VKS documentation. |
+| Headlamp secret-reference and Gateway TLS field names, needed to externalise the client secret and use a trusted CA. | Headlamp addon schema output. |
+| Istio strict-mTLS and resource field names, referenced without asserting spellings. | Istio addon schema output. |
+| The `maxSurge` your ClusterClass rollout strategy applies. This guide assumes the Cluster API default of 1, which sets your minimum spare-block reserve. | ClusterClass and `MachineDeployment` rollout strategy. |
+| Whether the per-node pod CIDR mask is tunable. This guide assumes the IPv4 default of `/24`, confirmed on live nodes. A `/25` would double your block count but is a create-time decision. | `kubectl get nodes -o custom-columns='NODE:.metadata.name,POD_CIDR:.spec.podCIDR'` and the ClusterClass schema. |
+| API server behaviour when a mapped `groups` claim is absent: tolerated, or does it reject? | Test with a real token and read the result from `kubectl auth whoami`. |
+| Whether `240.0.0.0/4` is handled correctly by every appliance in your path. Antrea supports it; your firewalls, hardware load balancers, and monitoring may not. | Test pod-to-external and external-to-service traffic end to end before standardising. |
+| Addon licensing and entitlement. Some addons imply other products, such as `ako` requiring NSX Advanced Load Balancer. Catalogue availability is not entitlement. | Your licensing, and `vcf addon available list`. |
+| Custom VM classes. The `best-effort` and `guaranteed` naming convention may not apply, so confirm whether a custom class reserves. | `kubectl get virtualmachineclass` and vCenter. |
+| PSS version strings valid for your Kubernetes minor. This guide uses `v1.36` to match `v1.36.1`. | Kubernetes documentation for your minor version. |
+| The practical `maxPods` ceiling for your node sizes. The schema documents 250 as the maximum; what your VM classes sustain is a capacity question. | Load-test at your intended density. |
+| The `systemReserved` formula. VKS documents the `automatic` flag but not its calculation, and the tiered model matched on two node sizes rather than being published. | Compare `capacity` against `allocatable` on your own nodes. |
 
-### Before you apply
+Answered by direct inspection, and stated as fact above:
 
-| # | Action | Why |
+| Question | Answer | Confirm with |
 | --- | --- | --- |
-| 1 | **Size the pod CIDR for maximum scale plus 2–3 spare blocks.** Use a `/16`. | Immutable, and an exhausted CIDR blocks upgrades ([7.1.1](#711-pod-cidr-sizing-node-blocks-maxpods-and-the-upgrade-spare)) |
-| 2 | **Choose your CNI deliberately.** | Effectively irreversible ([7.8](#78-bootstrapaddons--cni-selection)) |
-| 3 | **Pick a `kr` that is `READY` *and* `COMPATIBLE`**, and read what it ships. | A wrong version string never reconciles; and the release pins your etcd, CNI, and OS image choices ([section 2](#2-choosing-a-kubernetes-release-the-kr-object), [Appendix E](#appendix-e--inspecting-a-kubernetes-release-kr)) |
-| 4 | **Confirm VM classes and storage policies are associated with the namespace.** | Failures surface late and unhelpfully ([section 1](#1-prerequisites)) |
-| 5 | **Publish the Headlamp FQDN in DNS and register the redirect URI with your IdP.** | Removes the only real sequencing constraint ([6.5](#65-headlamp)) |
-| 6 | **Size `volumes` generously.** | Resizing later is a rolling node replacement ([7.6](#76-volumes--dedicated-containerd-and-kubelet-disks)) |
-| 7 | **Decide your namespace-creation policy** before enforcing Pod Security above `privileged`. | Otherwise `helm install --create-namespace` starts failing ([7.7.3](#773-securitypodsecuritystandard)) |
-| 8 | **If raising `maxPods`, size the VM class and `systemReserved` together.** | The automatic reservation does not scale with pod count; 250 pods needs `guaranteed-2xlarge` or larger ([7.13](#713-37-variables-not-used-in-the-sample)) |
-
-### Fix before production
-
-| # | Change | From → to |
-| --- | --- | --- |
-| 1 | **The claim validation rule** — it fails open regardless of environment | `orValue(true)` → `orValue(false)` |
-| 2 | **Control-plane HA** | `replicas: 1` → `3` |
-| 3 | **VM classes** | `best-effort-*` → `guaranteed-*`, control plane `guaranteed-large` |
-| 4 | **Pod Security** | `privileged` → `enforce: baseline` + `audit`/`warn: restricted`; raise to `restricted` per namespace, and decide your namespace-creation policy ([7.7.3](#773-securitypodsecuritystandard)) |
-| 5 | **Pin PSS versions** | `latest` → explicit (e.g. `v1.36`) |
-| 6 | **Istio availability** | `pilot` and ingress `minReplicas: 1` → `2`; drop the static `pilot.replicas` |
-| 7 | **Headlamp FQDN** | Publish the DNS A record and register the redirect URI with your IdP — the manifest value is only one of three places it must match ([6.5](#65-headlamp)) |
-| 8 | **Headlamp TLS** | self-signed → a trusted CA ([B.2](#b2-trusted-tls-for-the-headlamp-gateway)) |
-| 9 | **OIDC client secret** | inline → a Secret reference; rotate if ever committed |
-| 10 | **RBAC** | none → bindings for the OIDC username ([B.1](#b1-rbac-for-oidc-identities)) |
-| 11 | **Prometheus** | operator only → create the `Prometheus` CR ([B.3](#b3-a-prometheus-instance-via-the-operator)) |
-| 12 | **Gateway access logs** | `""` → `/dev/stdout` while validating |
-
-### Addons to consider
-
-Nothing beyond the five is a blanket recommendation — it depends on what you already run. Browse the
-catalogue in [6.6](#66-additional-addons-worth-considering). The three that most often come up —
-backup, log forwarding, and DNS automation — each need an environment-specific decision first, and
-are written up in [Appendix D](#appendix-d--optional-integrations-requiring-environment-specific-setup).
-
-### Keep — these parts of the sample are good practice
-
-- Dedicated `/var/lib/containerd` and `/var/lib/kubelet` volumes
-- `certificateRotation.enabled: true`
-- Explicit NTP configuration — a functional prerequisite for OIDC, TLS, and etcd
-- `owned-for-deletion` on every `AddonConfig`
-- The gateway in its own namespace, separate from the Istio control plane
-- Username **and** group prefixes on OIDC claim mappings
-- Structured JSON logging on both API server and kubelet
-- Reserved `240.0.0.0/4` space to avoid RFC1918 collisions
-- `resourceQuotaConfiguration.enabled: true` (a deliberate change from the schema default)
-- Pinned Kubernetes version and ClusterClass
-- `pushgateway: false`
-- Operator-managed Prometheus rather than the packaged server
-- The `controlPlane.variables.overrides` pattern for independent control-plane sizing
-- Autoscaler bounds with **no** static `replicas` — the correct pairing
-
-### Four points worth being explicit about
-
-1. **There is no addon ordering requirement.** All addons are Carvel packages reconciled
-   independently. **helm-controller is not a prerequisite** for the others — it exists for day-2 Helm
-   lifecycle management of *your own* charts.
-2. **Istio here provides L4/L7 only.** No sidecars, no mesh. Consequently `istioCNI: false` imposes
-   **no** Pod Security constraint on this cluster — the `privileged` setting is a dev/test choice, not
-   a consequence of Istio. That coupling only applies once you enable sidecar injection.
-3. **The pod CIDR is a pool of per-node `/24` blocks, not a flat pool of IPs** — and one block must
-   always stay free, or no rolling upgrade can complete.
-4. **PSS namespace labels and `exemptions.namespaces` are not two ways to do the same thing.** A label
-   applies a *different level* and keeps audit and warn working; an exemption switches Pod Security
-   *off* for that namespace. Prefer labels.
+| Are the Gateway API CRDs installed automatically? | Yes, the `gateway-api` addon is platform-installed | `kubectl get clusteraddon -n <ns>` |
+| Is the Cluster Autoscaler deployed by default? | Yes, so the machine-deployment annotations are effective | `kubectl get clusteraddon -n <ns>` |
+| Are addons delivered as Helm releases? | No, as Carvel `PackageInstall` objects | `kubectl get pkgi -A`; `kubectl get helmrelease -A` returns nothing |
+| Is there an addon ordering requirement? | No, all reconcile independently | Addon framework design |
+| What happens if an `AddonConfig` name does not resolve? | It skips reconciliation and `spec.clusterName` stays empty | `kubectl explain addonconfig.spec` |
+| `maxPods` default and maximum? | Default 110, documented maximum 250, minimum 20 | ClusterClass schema |
+| Does the Headlamp addon use cert-manager? | Yes, it creates a self-signed `Issuer` and `Certificate` | `kubectl get certificate,issuer -n headlamp` |
+| Does the Headlamp Gateway share the Istio ingress IP? | No, it provisions its own LoadBalancer | `kubectl get svc -n headlamp` |

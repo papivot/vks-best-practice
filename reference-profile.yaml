@@ -19,10 +19,6 @@
 #    * pods: 240.0.0.0/20              only 16 per-node blocks; IMMUTABLE
 #    * clientSecret inline             plaintext in etcd and in Git
 #
-#  And one value is a defect in ANY environment, not a dev/prod trade-off:
-#
-#    * claims.?email_verified.orValue(true)   ← FAILS OPEN. See Pitfall 1.
-#
 #  For a hardened, deployable manifest see APPENDIX A of the document.
 #  ---------------------------------------------------------------------------
 #
@@ -140,7 +136,7 @@ spec:
 #  NOTE THE NAMING: the AddonInstall is `cluster-prom` but the ADDON is
 #               `prometheus`, so the AddonConfig must be
 #               `workload-vsphere-vks2-prometheus`. Naming it `-prom` matches
-#               nothing. This is the canonical instance of Pitfall 2.
+#               nothing. Section 4 of the doc explains the naming rule.
 # -----------------------------------------------------------------------------
 apiVersion: addons.kubernetes.vmware.com/v1alpha1
 kind: AddonInstall
@@ -228,16 +224,16 @@ spec:
           namespace: istio-ingress         # separate from the control plane
           autoscaling:
             enabled: true
-            minReplicas: 1                 # ⚠️ 1 = ingress outage on reschedule
+            minReplicas: 1                 # 1 = ingress outage on reschedule
             maxReplicas: 5
       pilot:
-        replicas: 1                        # ⚠️ conflicts with the HPA below
+        replicas: 1                        # conflicts with the HPA below
         autoscaling:
           enabled: true
-          minReplicas: 1                   # ⚠️ istiod programs all gateways
+          minReplicas: 1                   # istiod programs all gateways
           maxReplicas: 2
       meshConfig:
-        accessLogFile: ""                  # ⚠️ your ingress request log, disabled
+        accessLogFile: ""                  # your ingress request log, disabled
         enableTracing: false
         meshID: "workload-vsphere-vks2"    # names the cluster, not the mesh
 
@@ -303,7 +299,7 @@ spec:
       issuerURL: https://idp.example.com
       # Must also appear in the API server's extraAuthentication audiences.
       clientID: <OIDC_CLIENT_ID>
-      clientSecret: <OIDC_CLIENT_SECRET>   # ⚠️ plaintext; prefer a Secret ref
+      clientSecret: <OIDC_CLIENT_SECRET>   # plaintext; prefer a Secret ref
       # Must be a registered redirect URI at your IdP.
       callbackURL: https://headlamp.k8s.example.com/oidc-callback
       scopes:
@@ -314,7 +310,7 @@ spec:
 
 ---
 # -----------------------------------------------------------------------------
-#  6 of 6 — The Cluster                                    [doc section 7, 7.1-7.13]
+#  6 of 6 — The Cluster                                    [doc section 7]
 #
 #  WHAT IT IS:  The workload cluster itself, defined by reference to the
 #               VMware-supplied `builtin-generic-v3.7.0` ClusterClass. The short
@@ -330,7 +326,7 @@ spec:
 #                 kubectl get clusterclass builtin-generic-v3.7.0 \
 #                   -n vmware-system-vks-public \
 #                   -o jsonpath='{range .status.variables[*]}{.name}{"\n"}{end}'
-#               Doc section 8 isolates the fields you cannot change later.
+#               Doc section 1.3 lists the fields you cannot change later.
 # -----------------------------------------------------------------------------
 apiVersion: cluster.x-k8s.io/v1beta2       # upstream Cluster API
 kind: Cluster
@@ -341,10 +337,10 @@ spec:
   clusterNetwork:
     pods:
       cidrBlocks:
-      # ⚠️ IMMUTABLE, and the most consequential number here. This is a pool of
+      # IMMUTABLE, and the most consequential number here. This is a pool of
       # per-node /24 blocks, not a flat pool of IPs: a /20 yields 16 blocks for
       # the WHOLE cluster, and one must always stay free for upgrade surge.
-      # Reserved 240/4 space avoids RFC1918 collisions. See doc 7.1.1.
+      # Reserved 240/4 space avoids RFC1918 collisions. See doc 7.1.
       - 240.0.0.0/20
     serviceDomain: cluster.local
     services:
@@ -360,9 +356,9 @@ spec:
           # A LABEL SELECTOR against OSImage objects. Test before applying:
           #   kubectl get osimage -l os-name=ubuntu,os-version=24.04,\
           #     run.tanzu.vmware.com/tkr=<kr-name>
-          # Expect exactly one match. See Appendix E.3.
+          # Expect exactly one match. See Appendix D.3.
           run.tanzu.vmware.com/resolve-os-image: os-name=ubuntu,os-version=24.04
-      replicas: 1                          # ⚠️ no etcd quorum, no HA
+      replicas: 1                          # no etcd quorum, no HA
       variables:
         overrides:                         # per-pool override of a cluster value
         - name: vmClass
@@ -371,7 +367,7 @@ spec:
     - name: storageClass                   # for the nodes' own disks
       value: <STORAGE_CLASS>
     - name: vmClass
-      value: best-effort-medium            # ⚠️ no reservation; dev/test only
+      value: best-effort-medium            # no reservation; dev/test only
     - name: volumes
       # GOOD PRACTICE — keep this. Moves image layers and ephemeral pod storage
       # off the node root disk, so one workload cannot wedge the node.
@@ -396,11 +392,11 @@ spec:
           maximumDBSizeGiB: 4
         security:
           podSecurityStandard:
-            # ⚠️ `privileged` enforces NOTHING. Fine for a lab; for production
+            # `privileged` enforces NOTHING. Fine for a lab; for production
             # use enforce: baseline with audit/warn: restricted, plus
-            # exemptions.namespaces for platform components. See doc 7.7.3.
+            # exemptions.namespaces for platform components. See doc 7.6.
             audit: privileged
-            auditVersion: latest           # ⚠️ unpinned: upgrades can tighten
+            auditVersion: latest           # unpinned: upgrades can tighten
             deactivated: false
             enforce: privileged
             enforceVersion: latest
@@ -429,16 +425,14 @@ spec:
                   # system: subject. Changing it orphans ALL RBAC bindings.
                   prefix: "oidc:"
                 groups:
-                  # ⚠️ VERIFY your IdP actually emits this claim — many do not
+                  # VERIFY your IdP actually emits this claim — many do not
                   # by default, and group RBAC then silently does nothing.
                   claim: groups
                   prefix: "oidc-groups:"
               claimValidationRules:
-              # ⚠️⚠️ THIS RULE FAILS OPEN. CEL optional chaining with
-              # orValue(TRUE) substitutes true when the claim is ABSENT, so a
-              # token omitting email_verified is ACCEPTED — the opposite of the
-              # message below. Use orValue(false). See Pitfall 1.
-              - expression: 'claims.?email_verified.orValue(true) == true'
+              # orValue(false) fails closed: a token that omits
+              # email_verified is rejected rather than admitted.
+              - expression: 'claims.?email_verified.orValue(false) == true'
                 message: "email must be verified"
         kubeletConfiguration:
           logging:
@@ -446,11 +440,11 @@ spec:
           # NOT SET here: maxPods (default 110, documented max 250). Raising it
           # buys pod density without consuming more pod CIDR blocks, but the
           # automatic systemReserved calculation does NOT scale with pod count.
-          # See doc 7.1.1 and 7.13.
+          # See doc 7.1 and 7.3.
     - name: bootstrapAddons
       value:
         cniRef:
-          # ⚠️ Effectively IMMUTABLE — changing the CNI means a new cluster.
+          # Effectively IMMUTABLE — changing the CNI means a new cluster.
           # Alternatives in the catalogue: calico, cilium.
           name: antrea
           namespace: vmware-system-vks-public

@@ -1,4 +1,4 @@
-# VKS 3.7: Cluster and Addon Best Practices
+# VKS: Cluster and Addon Best Practices
 
 A practical guide to deploying a VMware vSphere Kubernetes Service 3.7 workload cluster with a
 useful addon stack. It is organised around the decisions you have to make, in roughly the order you
@@ -7,7 +7,7 @@ have to make them, and it uses one complete manifest as a worked example through
 The example manifest referenced is [`reference-profile.yaml`](./reference-profile.yaml). It deploys five sample and suggested addons
 (helm-controller, cert-manager, Prometheus, Istio, Headlamp) onto a cluster built from the
 `builtin-generic-v3.7.0` ClusterClass, with OIDC authentication and dedicated node volumes. Open it
-alongside this guide.
+alongside this guide. The idea is to leverage this manifest as an example to explain some of the details and best practices around VKS and addons. 
 
 That profile is deliberately permissive in places so the platform can be explored without high
 availability or admission control restricting what can run. It is a demonstration, not a baseline.
@@ -103,7 +103,10 @@ Everything here runs through `kubectl` against the Supervisor. The `vcf` CLI cre
 writes the kubeconfig:
 
 ```bash
+# If authenticating to the Supervisor EP
 vcf context create <CONTEXT_NAME> --endpoint https://<SUPERVISOR_FQDN> --type k8s
+# or if authenticating to the VCFA EP (9.x)
+vcf context create <CONTEXT_NAME> --endpoint https://<VCFA_FQDN> --type cci --tenant-name <TENANT_ORG_NAME> --api-token <YOUR_API_TOKEN> 
 ```
 
 You end up with one context per vSphere Namespace you can reach, and one per workload cluster. Two
@@ -169,10 +172,12 @@ cluster and migrating workloads.
 
 Two more are technically changeable but expensive enough to treat the same way: `volumes` capacity,
 because resizing rebuilds every node in the pool, and moving `controlPlane.replicas` from 1 to 3,
-which is a rolling change you need a window for.
+which is a rolling change you need a window for. 
 
 Of these, pod network size is the one people get wrong. Read [7.1](#71-pod-and-service-networking)
 before you pick a prefix.
+
+NOTE: AS additional features are added, some of these new features may require new cluster buildouts. 
 
 ### 1.4 What to change before production
 
@@ -249,7 +254,7 @@ The newest compatible release is not automatically the right one.
 | Upgrade path | One minor version at a time. Skipping minors is unsupported. |
 | Fleet consistency | Standardise on one release per environment tier. Five patch levels across a fleet adds troubleshooting effort with no benefit. |
 
-A release pins more than the Kubernetes version. It also fixes your etcd version, your CNI version,
+IMPORTANT: A release pins more than the Kubernetes version. It also fixes your etcd version, your CNI version,
 and which node OS images you may select. [Appendix D](#appendix-d-reading-a-kubernetes-release-object)
 shows how to read all of that out of the object, and includes a pre-upgrade diff worth running before
 any version change.
@@ -261,7 +266,7 @@ The version used throughout this guide is illustrative. Substitute whatever your
 ## 3. What the platform already gives you
 
 A VKS cluster arrives with a set of addons you do not declare. Knowing what they are saves you
-installing something twice.
+from incorrect choices.
 
 ```bash
 kubectl get clusteraddon -n <VSPHERE_NAMESPACE>
@@ -285,7 +290,7 @@ what a fresh cluster has.
 | vks-static-resources | Version-matched platform resources |
 
 Two of those answer questions that come up constantly. The Gateway API CRDs are already present, so
-`gatewayApi.enabled: true` has something to bind to without you installing anything. And the Cluster
+`gatewayApi.enabled: true` has something to bind to without you installing anything. And, based on the relevent settings, the Cluster
 Autoscaler is already running, which is what makes the machine-deployment scaling annotations in
 [7.5](#75-worker-pools) effective rather than decorative.
 
@@ -479,7 +484,7 @@ Declarative Helm chart lifecycle management inside the workload cluster. You cre
 objects; helm-controller and its companion source-controller reconcile them, handling upgrades,
 rollbacks, and drift.
 
-This is a day-2 capability for your own charts. It does not deliver the other addons and they do not
+This is a day-2 capability for your own charts. It does not deliver the other addons (as of now) and they do not
 wait for it, so install it because you want GitOps-style Helm management, not because the stack needs
 it. If you are not managing charts declaratively in this cluster, it is optional.
 
@@ -493,9 +498,7 @@ spec:
 ```
 
 Empty string means no PriorityClass, so both controllers run at default priority and are as evictable
-as a batch job under node pressure. If production workloads arrive through Helm releases, the
-controller that keeps them in sync being evicted means drift goes uncorrected. `system-cluster-critical`
-is the better choice.
+as a batch job under node pressure.
 
 This config also demonstrates the overlay model: it sets two fields, and every other
 helm-controller setting comes from the schema.
